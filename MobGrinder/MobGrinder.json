@@ -11,5 +11,5 @@
   "CanUnloadAsync": true,
   "Tags": ["Automation", "Combat", "Mob"],
   "IconUrl": "https://raw.githubusercontent.com/irimsky/MobGrinder/main/images/icon.png",
-  "Changelog": "完善配置迁移、生命周期清理、测试与发布验证链。"
+  "Changelog": "新增悬浮窗目标进度显示；扫描预设中的任意未完成目标并分别统计击杀数。"
 }
