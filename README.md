@@ -4,6 +4,8 @@
 
 当前项目版本为 `0.1.0.0`。源码仓库：<https://github.com/irimsky/MobGrinder>。
 
+首个公开版本 [`v0.1.0.0`](https://github.com/irimsky/MobGrinder/releases/tag/v0.1.0.0) 已发布。
+
 ## 功能和依赖
 
 MobGrinder 使用以下服务完成自动流程：
@@ -18,9 +20,9 @@ MobGrinder 使用以下服务完成自动流程：
 
 ## 安装
 
-正式版本发布后，可从 [GitHub Releases](https://github.com/irimsky/MobGrinder/releases) 下载 `latest.zip`，并按 Dalamud 的本地插件方式安装。
+可以从 [GitHub Releases](https://github.com/irimsky/MobGrinder/releases) 下载当前版本的 [`latest.zip`](https://github.com/irimsky/MobGrinder/releases/download/v0.1.0.0/latest.zip)，并按 Dalamud 的本地插件方式安装。
 
-第三方 Dalamud 插件清单仓库为 [`irimsky/DalamudPlugins`](https://github.com/irimsky/DalamudPlugins)，订阅地址为 [`manifest.json`](https://raw.githubusercontent.com/irimsky/DalamudPlugins/main/manifest.json)。Release workflow 默认使用这个仓库；只有需要覆盖默认目标时才配置 `MOBGRINDER_MANIFEST_REPOSITORY`。
+第三方 Dalamud 插件清单仓库为 [`irimsky/DalamudPlugins`](https://github.com/irimsky/DalamudPlugins)，订阅地址为 [`manifest.json`](https://raw.githubusercontent.com/irimsky/DalamudPlugins/main/manifest.json)。Release workflow 默认使用这个仓库；只有需要覆盖默认目标时才配置 `MOBGRINDER_MANIFEST_REPOSITORY`。若清单条目已经合并，也可以在 Dalamud 的第三方插件仓库设置中添加该 Raw 地址。
 
 首次使用前请确认 vnavmesh、Lifestream 和战斗插件已经安装并正常运行。缺少这些依赖时，MobGrinder 会停止相关流程，不会替代战斗插件执行技能。
 
@@ -98,4 +100,4 @@ GitHub Actions 的行为如下：
 - `Release`：推送匹配版本的 tag 后构建并发布 GitHub Release；
 - 外部 Dalamud manifest 更新：只有手动运行 Release workflow、选择 `manifest_update=pr`，并配置 `DALAMUD_MANIFEST_TOKEN` 后才会创建 PR；目标仓库默认是 `irimsky/DalamudPlugins`，仓库变量仅用于覆盖默认值。
 
-当前状态：CI workflow 已提交，但尚未在 GitHub Actions 中实际运行；插件也尚未完成游戏内加载、重载、卸载、登出、切地图、依赖失效和完整战斗流程验证。
+当前状态：GitHub Release `v0.1.0.0` 已创建，Release workflow 已完成构建和发布链路；插件仍尚未完成游戏内加载、重载、卸载、登出、切地图、依赖失效和完整战斗流程验证。
