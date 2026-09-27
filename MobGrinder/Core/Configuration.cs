@@ -80,6 +80,9 @@ public sealed class MobGrinderConfiguration : IPluginConfiguration
     /// <summary>Game built-in sound effect id, 0 disables the sound.</summary>
     public uint SoundAlertCycleCompletedEffectId { get; set; } = 1;
 
+    /// <summary>Whether the compact always-available run overlay is shown.</summary>
+    public bool ShowOverlayWindow { get; set; }
+
     /// <summary>
     /// Applies schema changes before value clamping. Keep this separate from Normalize so a
     /// configuration loaded from an older plugin version has an explicit migration path.

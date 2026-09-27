@@ -65,11 +65,36 @@ public sealed class ConfigurationTests
     [Fact]
     public void Configuration_RoundTripsWithoutPersistingRuntimeEnabledState()
     {
-        MobGrinderConfiguration configuration = new() { Enabled = true };
+        MobGrinderConfiguration configuration = new() { Enabled = true, ShowOverlayWindow = true };
         string json = JsonConvert.SerializeObject(configuration);
         MobGrinderConfiguration restored = JsonConvert.DeserializeObject<MobGrinderConfiguration>(json)!;
 
         Assert.False(restored.Enabled);
+        Assert.True(restored.ShowOverlayWindow);
         Assert.Equal(MobGrinderConfiguration.CurrentVersion, restored.Version);
+    }
+
+    [Fact]
+    public void TargetProgressPolicyRequiresEveryStopCondition()
+    {
+        MobTargetPreset target = new()
+        {
+            StopConditions =
+            [
+                new MobStopCondition { Kind = MobStopConditionKind.MobCount, MobCount = 3 },
+                new MobStopCondition { Kind = MobStopConditionKind.ItemCount, ItemId = 42, ItemCount = 2 },
+            ],
+        };
+
+        Assert.False(MobTargetProgressPolicy.AreStopConditionsMet(target, 3, _ => 1));
+        Assert.True(MobTargetProgressPolicy.AreStopConditionsMet(target, 3, _ => 2));
+    }
+
+    [Fact]
+    public void TargetProgressPolicySkipsCompletedItemsAndWraps()
+    {
+        Assert.Equal(2, MobTargetProgressPolicy.FindNextIncompleteIndex([true, true, false, false], 0));
+        Assert.Equal(0, MobTargetProgressPolicy.FindNextIncompleteIndex([false, true, true], 2));
+        Assert.Equal(-1, MobTargetProgressPolicy.FindNextIncompleteIndex([true, true], 1));
     }
 }

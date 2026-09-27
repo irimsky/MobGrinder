@@ -14,6 +14,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
     private readonly MobSpawnDataService spawnData;
     private readonly MobGrinderController controller;
     private readonly MobGrinderWindow window;
+    private readonly MobGrinderOverlayWindow overlayWindow;
     private readonly MobGrinderLogWindow logWindow;
     private readonly WindowSystem windowSystem = new("MobGrinder");
 
@@ -45,6 +46,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
         bool primaryCommandRegistered = false;
         bool shortCommandRegistered = false;
         MobGrinderWindow? window = null;
+        MobGrinderOverlayWindow? overlayWindow = null;
 
         try
         {
@@ -92,8 +94,11 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 this.configuration,
                 controller,
                 this.SaveConfiguration,
-                logWindow.Open);
+                logWindow.Open,
+                visible => overlayWindow?.SetVisible(visible));
+            overlayWindow = new(this.pluginInterface, this.configuration, window);
             this.windowSystem.AddWindow(window);
+            this.windowSystem.AddWindow(overlayWindow);
             this.windowSystem.AddWindow(logWindow);
 
             this.pluginInterface.UiBuilder.Draw += this.windowSystem.Draw;
@@ -120,6 +125,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
 
             this.controller = controller!;
             this.window = window!;
+            this.overlayWindow = overlayWindow!;
             this.logWindow = logWindow;
             this.log.Information("MobGrinder 插件已加载");
         }

@@ -12,6 +12,7 @@ public sealed class MobGrinderWindow : Window
     private readonly MobGrinderController controller;
     private readonly Action saveConfiguration;
     private readonly Action openLogWindow;
+    private readonly Action<bool> setOverlayVisibility;
     private readonly Dictionary<string, string> selectorSearch = new(StringComparer.Ordinal);
     private int presetTargetIndex;
     private bool confirmPresetDelete;
@@ -20,13 +21,15 @@ public sealed class MobGrinderWindow : Window
         MobGrinderConfiguration configuration,
         MobGrinderController controller,
         Action saveConfiguration,
-        Action openLogWindow)
+        Action openLogWindow,
+        Action<bool>? setOverlayVisibility = null)
         : base("MobGrinder")
     {
         this.configuration = configuration;
         this.controller = controller;
         this.saveConfiguration = saveConfiguration;
         this.openLogWindow = openLogWindow;
+        this.setOverlayVisibility = setOverlayVisibility ?? (_ => { });
 
         this.Size = new Vector2(760, 700);
         this.SizeCondition = ImGuiCond.FirstUseEver;
@@ -38,6 +41,24 @@ public sealed class MobGrinderWindow : Window
     }
 
     public void Open() => this.IsOpen = true;
+
+    public void OpenDiagnosticLog() => this.openLogWindow();
+
+    public void DrawOverlayContents()
+    {
+        ImGui.PushStyleVar(ImGuiStyleVar.ItemSpacing, new Vector2(7f, 5f));
+        this.DrawOverlayControls();
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.35f, 0.8f, 1f, 1f), "运行状态");
+        ImGui.TextUnformatted($"状态：{this.controller.State}");
+        ImGui.TextColored(new Vector4(1f, 0.8f, 0.35f, 1f), $"说明：{this.controller.StatusReason}");
+        ImGui.TextUnformatted($"当前路线：{this.controller.CurrentTargetDescription}");
+        ImGui.TextUnformatted($"刷怪进度：{this.controller.CompletedTargetCount} / {this.controller.TotalTargetCount}");
+        ImGui.Separator();
+        ImGui.TextColored(new Vector4(0.35f, 0.8f, 1f, 1f), "本次目标");
+        this.DrawTargetProgressList("MobGrinderOverlayTargetProgress");
+        ImGui.PopStyleVar();
+    }
 
     public override void Draw()
     {
@@ -73,6 +94,15 @@ public sealed class MobGrinderWindow : Window
     {
         string fingerprintBefore = this.GetConfigurationFingerprint();
 
+        bool showOverlay = this.configuration.ShowOverlayWindow;
+        if (ImGui.Checkbox("显示悬浮窗", ref showOverlay))
+        {
+            this.configuration.ShowOverlayWindow = showOverlay;
+            this.setOverlayVisibility(showOverlay);
+            this.saveConfiguration();
+        }
+        ImGui.TextDisabled("悬浮窗显示开始、暂停、停止按钮，以及本次运行的目标进度。可拖到游戏角落长期查看。");
+        ImGui.Separator();
         ImGui.TextUnformatted("扫描诊断设置");
         this.DrawScanSettings();
 
@@ -128,6 +158,25 @@ public sealed class MobGrinderWindow : Window
             this.controller.CaptureSupplementData();
         if (ImGui.IsItemHovered())
             ImGui.SetTooltip("记录当前地图、角色坐标和当前游戏目标的 BNpcNameId；日志关键词：MG_SUPPLEMENT_CAPTURE");
+    }
+
+    private void DrawOverlayControls()
+    {
+        float buttonWidth = MathF.Max(72f, (ImGui.GetContentRegionAvail().X - 14f) / 3f);
+        ImGui.BeginDisabled(!this.controller.CanStart);
+        if (ImGui.Button(this.controller.State == AutomationState.Paused ? "继续" : "开始", new Vector2(buttonWidth, 0)))
+            this.controller.Start();
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!this.controller.CanPause);
+        if (ImGui.Button("暂停", new Vector2(buttonWidth, 0)))
+            this.controller.Pause();
+        ImGui.EndDisabled();
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!this.controller.CanStop);
+        if (ImGui.Button("停止", new Vector2(buttonWidth, 0)))
+            this.controller.Stop();
+        ImGui.EndDisabled();
     }
 
     private void DrawStatus()
@@ -639,6 +688,7 @@ public sealed class MobGrinderWindow : Window
         this.configuration.RunMode,
         this.configuration.EnableSoundAlerts,
         this.configuration.SoundAlertCycleCompletedEffectId,
+        this.configuration.ShowOverlayWindow,
     });
 
     private string GetSelectorSearch(string key) => this.selectorSearch.GetValueOrDefault(key, string.Empty);
@@ -692,6 +742,41 @@ public sealed class MobGrinderWindow : Window
             }
         }
 
+        ImGui.EndChild();
+    }
+
+    private void DrawTargetProgressList(string childId)
+    {
+        bool childVisible = ImGui.BeginChild(
+            childId,
+            new Vector2(0, 0),
+            true,
+            ImGuiWindowFlags.AlwaysVerticalScrollbar);
+        if (childVisible)
+        {
+            IReadOnlyList<MobTargetProgress> progress = this.controller.TargetProgress;
+            if (progress.Count == 0)
+            {
+                ImGui.TextDisabled("当前预设还没有目标野怪。");
+            }
+            else
+            {
+                foreach (MobTargetProgress target in progress)
+                {
+                    Vector4 color = target.IsCompleted
+                        ? new Vector4(0.35f, 0.9f, 0.45f, 1f)
+                        : target.Index == this.controller.CurrentTargetIndex
+                            ? new Vector4(1f, 0.85f, 0.35f, 1f)
+                            : new Vector4(0.9f, 0.9f, 0.9f, 1f);
+                    ImGui.TextColored(color, $"{target.Index + 1}. {target.DisplayName}");
+                    ImGui.Indent(16f);
+                    ImGui.TextColored(color, $"击杀：{target.KillCount}    {target.StopConditionProgress}");
+                    ImGui.Unindent(16f);
+                    if (target.Index + 1 < progress.Count)
+                        ImGui.Separator();
+                }
+            }
+        }
         ImGui.EndChild();
     }
 }

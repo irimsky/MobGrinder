@@ -33,6 +33,20 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         Fly,
     }
 
+    private sealed class RuntimeTargetProgress
+    {
+        public RuntimeTargetProgress(int index, MobTargetPreset target)
+        {
+            this.Index = index;
+            this.Target = target;
+        }
+
+        public int Index { get; }
+        public MobTargetPreset Target { get; }
+        public int KillCount { get; set; }
+        public bool IsCompleted { get; set; }
+    }
+
     private readonly record struct MobEligibility(
         bool IsEligible,
         string Reason,
@@ -81,10 +95,13 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private DateTime combatBecameIdleAt = DateTime.MinValue;
     private IReadOnlyList<MobSnapshot> mobs = [];
     private IReadOnlyList<Vector3> spawnPoints = [];
+    private List<RuntimeTargetProgress> targetProgress = [];
+    private int targetProgressPresetIndex = -1;
     private int targetIndex;
     private int spawnPointIndex;
     private int currentTargetKillCount;
     private ulong selectedTargetId;
+    private int selectedTargetIndex = -1;
     private bool selectedTargetWasEngaged;
     private bool targetInterruptedBeforeArrival;
     private bool forceCombatReposition;
@@ -168,6 +185,10 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     public bool IsLoadingSpawnPoints => this.spawnPoints.Count == 0
         && this.State is AutomationState.ValidatingPlan or AutomationState.AdvancingTarget;
     public int CurrentTargetKillCount => this.currentTargetKillCount;
+    public IReadOnlyList<MobTargetProgress> TargetProgress => this.GetTargetProgressSnapshot();
+    public int CompletedTargetCount => this.TargetProgress.Count(progress => progress.IsCompleted);
+    public int TotalTargetCount => this.TargetProgress.Count;
+    public int CurrentTargetIndex => this.targetIndex;
     public IReadOnlyList<DiagnosticEntry> Diagnostics
     {
         get
@@ -202,10 +223,9 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     public bool IsCurrentConfiguredTarget(MobSnapshot mob)
     {
-        MobTargetPreset? target = this.configuration.GetActivePresetList().Targets.ElementAtOrDefault(this.targetIndex);
-        return target is not null
-            && target.BNpcNameId == mob.BNpcNameId
-            && target.TerritoryTypeId == this.TerritoryId;
+        return this.configuration.GetActivePresetList().Targets.Any(target =>
+            target.BNpcNameId == mob.BNpcNameId
+            && target.TerritoryTypeId == this.TerritoryId);
     }
 
     public bool WasTargetSkippedThisRun(MobSnapshot mob) =>
@@ -226,7 +246,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.configuration.Enabled = true;
         if (this.State == AutomationState.Stopped)
         {
-            this.ResetRuntime();
+            this.ResetRuntime(resetTargetProgress: true);
             this.SetState(AutomationState.ValidatingPlan, "正在验证当前预设");
             this.log.Information("MobGrinder 自动刷怪已启动");
         }
@@ -519,6 +539,13 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             this.FailAutomation("当前预设没有野怪项目");
             return;
         }
+        if (this.targetProgressPresetIndex != this.configuration.ActivePresetListIndex
+            || this.targetProgress.Count != preset.Targets.Count)
+            this.InitializeTargetProgress();
+        this.RefreshTargetProgress();
+        if (!this.TrySelectNextIncompleteTarget())
+            return;
+
         this.targetIndex = Math.Clamp(this.targetIndex, 0, preset.Targets.Count - 1);
         MobTargetPreset target = preset.Targets[this.targetIndex];
         if (target.BNpcNameId == 0 || target.TerritoryTypeId == 0)
@@ -526,12 +553,6 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             this.FailAutomation($"预设第 {this.targetIndex + 1} 项尚未选择有效的地图和野怪");
             return;
         }
-        if (this.AreStopConditionsMet(target))
-        {
-            this.SetState(AutomationState.AdvancingTarget, "当前野怪项目的停止条件已满足");
-            return;
-        }
-
         this.spawnPoints = this.GetCurrentSpawnPoints();
         this.spawnPointHoverDestinations = [];
         this.spawnPointHeightsResolved = false;
@@ -687,7 +708,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             this.SetState(AutomationState.AdvancingSpawnPoint, "刷新点等待结束，继续下一个刷新点");
     }
 
-    private void BeginTarget(IBattleNpc target, DateTime now)
+    private void BeginTarget(IBattleNpc target, int configuredTargetIndex, DateTime now)
     {
         IPlayerCharacter? player = this.objectTable.LocalPlayer;
         if (player is null)
@@ -703,11 +724,14 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             return;
         }
 
-        this.targetInterruptedBeforeArrival = this.State == AutomationState.NavigatingToSpawnPoint
-            && !this.IsAtCurrentHover(player.Position);
+        this.targetInterruptedBeforeArrival = this.State is
+            AutomationState.PreparingFlight
+            or AutomationState.NavigatingToSpawnPoint
+            or AutomationState.WaitingAtSpawnPoint;
         this.EndTravelSession();
         this.StopMovement();
         this.selectedTargetId = target.GameObjectId;
+        this.selectedTargetIndex = configuredTargetIndex;
         this.selectedTargetWasEngaged = false;
         this.combatWaitDeadline = DateTime.MinValue;
         this.forceCombatReposition = false;
@@ -1029,14 +1053,25 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         if (now - this.combatBecameIdleAt < TimeSpan.FromSeconds(1))
             return;
 
-        this.currentTargetKillCount++;
+        int completedTargetIndex = this.selectedTargetIndex >= 0
+            ? this.selectedTargetIndex
+            : this.targetIndex;
+        if (completedTargetIndex >= 0 && completedTargetIndex < this.targetProgress.Count)
+        {
+            RuntimeTargetProgress progress = this.targetProgress[completedTargetIndex];
+            progress.KillCount++;
+            progress.IsCompleted = this.AreStopConditionsMet(progress.Target, progress.KillCount);
+        }
+        this.currentTargetKillCount = this.GetCurrentTargetKillCount();
         this.EndTravelSession();
         this.selectedTargetId = 0;
+        this.selectedTargetIndex = -1;
         this.selectedTargetWasEngaged = false;
         this.combatWaitDeadline = DateTime.MinValue;
         this.forceCombatReposition = false;
         this.landing.StopDescending();
-        if (this.AreStopConditionsMet(this.CurrentTargetSpec()))
+        this.RefreshTargetProgress();
+        if (this.IsCurrentTargetComplete())
             this.SetState(AutomationState.AdvancingTarget, "当前野怪项目停止条件已满足，进入预设下一个项目");
         else if (this.targetInterruptedBeforeArrival)
         {
@@ -1051,25 +1086,27 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private void AdvanceTarget(DateTime now)
     {
         MobGrinderPreset preset = this.configuration.GetActivePresetList();
-        bool completedCycle = this.targetIndex + 1 >= preset.Targets.Count;
-        if (completedCycle)
+        this.RefreshTargetProgress();
+        if (this.targetProgress.All(progress => progress.IsCompleted))
         {
             this.PlayCycleCompletedSound();
-            if (this.configuration.RunMode != MobRunMode.StopAfterOneCycle)
-                this.targetIndex = 0;
-            else
+            if (this.configuration.RunMode == MobRunMode.StopAfterOneCycle)
             {
                 this.FinishCycle();
                 return;
             }
 
+            this.InitializeTargetProgress();
+            this.targetIndex = 0;
         }
         else
         {
-            this.targetIndex++;
+            this.targetIndex = (this.targetIndex + 1) % preset.Targets.Count;
+            if (!this.TrySelectNextIncompleteTarget())
+                return;
         }
 
-        this.currentTargetKillCount = 0;
+        this.currentTargetKillCount = this.GetCurrentTargetKillCount();
         this.targetInterruptedBeforeArrival = false;
         this.walkSprintAttempted = false;
         if (this.targetIndex >= preset.Targets.Count)
@@ -1303,17 +1340,71 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.log.Warning("MobGrinder 刷新点地面高度解析失败：{Reason}", reason);
     }
 
-    private bool AreStopConditionsMet(MobTargetPreset target)
+    private void InitializeTargetProgress()
     {
-        if (target.StopConditions.Count == 0)
-            return false;
-        return target.StopConditions.All(condition => condition.Kind switch
+        MobGrinderPreset preset = this.configuration.GetActivePresetList();
+        this.targetProgressPresetIndex = this.configuration.ActivePresetListIndex;
+        this.targetProgress = preset.Targets
+            .Select((target, index) => new RuntimeTargetProgress(index, target))
+            .ToList();
+        this.RefreshTargetProgress();
+    }
+
+    private void RefreshTargetProgress()
+    {
+        foreach (RuntimeTargetProgress progress in this.targetProgress)
+            progress.IsCompleted = this.AreStopConditionsMet(progress.Target, progress.KillCount);
+    }
+
+    private bool TrySelectNextIncompleteTarget()
+    {
+        this.RefreshTargetProgress();
+        if (this.targetProgress.Count == 0)
         {
-            MobStopConditionKind.MobCount => this.currentTargetKillCount >= Math.Max(1, condition.MobCount),
-            MobStopConditionKind.ItemCount => condition.ItemId != 0
-                && this.inventoryCounter.Count(condition.ItemId) >= Math.Max(1, condition.ItemCount),
-            _ => false,
-        });
+            this.FailAutomation("当前预设没有野怪项目");
+            return false;
+        }
+
+        if (this.targetProgress.All(progress => progress.IsCompleted))
+        {
+            this.PlayCycleCompletedSound();
+            if (this.configuration.RunMode == MobRunMode.StopAfterOneCycle)
+            {
+                this.FinishCycle();
+                return false;
+            }
+
+            this.InitializeTargetProgress();
+            this.targetIndex = 0;
+        }
+
+        int candidate = MobTargetProgressPolicy.FindNextIncompleteIndex(
+            this.targetProgress.Select(progress => progress.IsCompleted).ToArray(),
+            this.targetIndex);
+        if (candidate < 0)
+            return false;
+
+        this.targetIndex = candidate;
+        this.currentTargetKillCount = this.targetProgress[candidate].KillCount;
+        return true;
+    }
+
+    private bool IsCurrentTargetComplete() =>
+        this.targetIndex >= 0
+        && this.targetIndex < this.targetProgress.Count
+        && this.targetProgress[this.targetIndex].IsCompleted;
+
+    private int GetCurrentTargetKillCount() =>
+        this.targetIndex >= 0 && this.targetIndex < this.targetProgress.Count
+            ? this.targetProgress[this.targetIndex].KillCount
+            : 0;
+
+    private bool AreStopConditionsMet(MobTargetPreset target, int killCount)
+    {
+        return MobTargetProgressPolicy.AreStopConditionsMet(
+            target,
+            killCount,
+            this.inventoryCounter.Count);
     }
 
     private IBattleNpc? TryFindTargetMob(MobTargetPreset target)
@@ -1435,17 +1526,51 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     {
         if (this.configuration.GetActivePresetList().Targets.Count == 0)
             return false;
-        if (this.State != AutomationState.NavigatingToSpawnPoint)
+        if (this.State is not (
+                AutomationState.PreparingFlight
+                or AutomationState.NavigatingToSpawnPoint
+                or AutomationState.WaitingAtSpawnPoint))
             return false;
         if (this.travelSessionActive
             && this.travelSession.State != FieldNavigation.NavigationTravelState.Navigating)
             return false;
-        MobTargetPreset target = this.CurrentTargetSpec();
-        if (this.TryFindTargetMob(target) is not { } mob)
+        if (!this.TryFindAnyTargetMob(out IBattleNpc? mob, out int configuredTargetIndex)
+            || mob is null)
+        {
+            if (this.IsCurrentTargetComplete())
+            {
+                this.StopMovement();
+                this.SetState(AutomationState.AdvancingTarget, "当前野怪项目停止条件已满足，跳过剩余刷新点");
+                return true;
+            }
             return false;
+        }
 
-        this.BeginTarget(mob, now);
+        this.BeginTarget(mob, configuredTargetIndex, now);
         return true;
+    }
+
+    private bool TryFindAnyTargetMob(out IBattleNpc? mob, out int configuredTargetIndex)
+    {
+        mob = null;
+        configuredTargetIndex = -1;
+        this.RefreshTargetProgress();
+        foreach (RuntimeTargetProgress progress in this.targetProgress.Where(progress => !progress.IsCompleted))
+        {
+            IBattleNpc? candidate = this.TryFindTargetMob(progress.Target);
+            if (candidate is null)
+                continue;
+
+            if (mob is null || this.objectTable.LocalPlayer is { } player
+                && Vector3.DistanceSquared(player.Position, candidate.Position)
+                < Vector3.DistanceSquared(player.Position, mob.Position))
+            {
+                mob = candidate;
+                configuredTargetIndex = progress.Index;
+            }
+        }
+
+        return mob is not null;
     }
 
     private static TargetApproachMode GetTargetApproachMode(Vector3 player, Vector3 target)
@@ -1497,12 +1622,6 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         ? null
         : this.objectTable.OfType<IBattleNpc>().FirstOrDefault(mob => mob.GameObjectId == objectId);
 
-    private MobTargetPreset CurrentTargetSpec()
-    {
-        MobGrinderPreset preset = this.configuration.GetActivePresetList();
-        return preset.Targets[Math.Clamp(this.targetIndex, 0, preset.Targets.Count - 1)];
-    }
-
     private IReadOnlyList<Vector3> GetCurrentSpawnPoints()
     {
         MobTargetPreset? target = this.configuration.GetActivePresetList().Targets.ElementAtOrDefault(this.targetIndex);
@@ -1517,6 +1636,53 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         return target is null
             ? null
             : this.spawnData.MobTargets.FirstOrDefault(entry => entry.BNpcNameId == target.BNpcNameId && entry.TerritoryTypeId == target.TerritoryTypeId);
+    }
+
+    private IReadOnlyList<MobTargetProgress> GetTargetProgressSnapshot()
+    {
+        MobGrinderPreset preset = this.configuration.GetActivePresetList();
+        IReadOnlyList<RuntimeTargetProgress> source = this.targetProgressPresetIndex == this.configuration.ActivePresetListIndex
+            && this.targetProgress.Count == preset.Targets.Count
+            ? this.targetProgress
+            : preset.Targets.Select((target, index) => new RuntimeTargetProgress(index, target)).ToArray();
+        if (source.Any(progress => progress.Target.StopConditions.Count > 0 && !progress.IsCompleted))
+        {
+            foreach (RuntimeTargetProgress progress in source)
+                progress.IsCompleted = this.AreStopConditionsMet(progress.Target, progress.KillCount);
+        }
+
+        return source.Select(progress => new MobTargetProgress(
+                progress.Index,
+                this.GetTargetDisplayName(progress.Target),
+                progress.Target.BNpcNameId,
+                progress.Target.TerritoryTypeId,
+                progress.KillCount,
+                progress.IsCompleted,
+                this.GetStopConditionProgress(progress.Target, progress.KillCount)))
+            .ToArray();
+    }
+
+    private string GetTargetDisplayName(MobTargetPreset target)
+    {
+        MobSelectionEntry? entry = this.spawnData.MobTargets.FirstOrDefault(item =>
+            item.BNpcNameId == target.BNpcNameId && item.TerritoryTypeId == target.TerritoryTypeId);
+        return entry?.DisplayName ?? $"未知目标（{target.TerritoryTypeId}/{target.BNpcNameId}）";
+    }
+
+    private string GetStopConditionProgress(MobTargetPreset target, int killCount)
+    {
+        if (target.StopConditions.Count == 0)
+            return "无停止条件";
+
+        return string.Join("；", target.StopConditions.Select(condition => condition.Kind switch
+        {
+            MobStopConditionKind.MobCount => $"击杀 {killCount}/{Math.Max(1, condition.MobCount)}",
+            MobStopConditionKind.ItemCount when condition.ItemId != 0 =>
+                $"{this.spawnData.GetItemName(condition.ItemId)} "
+                + $"{this.inventoryCounter.Count(condition.ItemId)}/{Math.Max(1, condition.ItemCount)}",
+            MobStopConditionKind.ItemCount => "物品未选择",
+            _ => "未知停止条件",
+        }));
     }
 
     private void Scan(DateTime now)
@@ -1546,12 +1712,15 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             .ToArray();
     }
 
-    private void ResetRuntime()
+    private void ResetRuntime(bool resetTargetProgress = false)
     {
+        if (resetTargetProgress)
+            this.InitializeTargetProgress();
         this.targetIndex = 0;
         this.spawnPointIndex = 0;
         this.currentTargetKillCount = 0;
         this.selectedTargetId = 0;
+        this.selectedTargetIndex = -1;
         this.selectedTargetWasEngaged = false;
         this.targetInterruptedBeforeArrival = false;
         this.combatWaitDeadline = DateTime.MinValue;
