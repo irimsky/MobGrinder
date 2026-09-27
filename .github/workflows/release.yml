@@ -178,7 +178,7 @@ jobs:
       - name: Checkout external manifest repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ vars.MOBGRINDER_MANIFEST_REPOSITORY }}
+          repository: ${{ vars.MOBGRINDER_MANIFEST_REPOSITORY || 'irimsky/DalamudPlugins' }}
           token: ${{ secrets.DALAMUD_MANIFEST_TOKEN }}
           path: manifest
       - name: Update manifest entry
@@ -198,7 +198,7 @@ jobs:
         working-directory: manifest
         env:
           GH_TOKEN: ${{ secrets.DALAMUD_MANIFEST_TOKEN }}
-          MANIFEST_REPOSITORY: ${{ vars.MOBGRINDER_MANIFEST_REPOSITORY }}
+          MANIFEST_REPOSITORY: ${{ vars.MOBGRINDER_MANIFEST_REPOSITORY || 'irimsky/DalamudPlugins' }}
           RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
           RELEASE_URL: ${{ needs.release.outputs.release_url }}
         run: |

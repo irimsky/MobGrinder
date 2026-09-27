@@ -20,7 +20,7 @@ MobGrinder 使用以下服务完成自动流程：
 
 正式版本发布后，可从 [GitHub Releases](https://github.com/irimsky/MobGrinder/releases) 下载 `latest.zip`，并按 Dalamud 的本地插件方式安装。
 
-第三方 Dalamud 插件仓库清单尚未配置；配置完成后会在这里补充清单订阅地址。
+第三方 Dalamud 插件清单仓库为 [`irimsky/DalamudPlugins`](https://github.com/irimsky/DalamudPlugins)，订阅地址为 [`manifest.json`](https://raw.githubusercontent.com/irimsky/DalamudPlugins/main/manifest.json)。Release workflow 默认使用这个仓库；只有需要覆盖默认目标时才配置 `MOBGRINDER_MANIFEST_REPOSITORY`。
 
 首次使用前请确认 vnavmesh、Lifestream 和战斗插件已经安装并正常运行。缺少这些依赖时，MobGrinder 会停止相关流程，不会替代战斗插件执行技能。
 
@@ -96,6 +96,6 @@ GitHub Actions 的行为如下：
 
 - `Pull Request Build`：PR 自动运行，也可以在 Actions 页面手动运行；
 - `Release`：推送匹配版本的 tag 后构建并发布 GitHub Release；
-- 外部 Dalamud manifest 更新：只有手动运行 Release workflow、选择 `manifest_update=pr`，并配置对应仓库变量和 token 后才会创建 PR。
+- 外部 Dalamud manifest 更新：只有手动运行 Release workflow、选择 `manifest_update=pr`，并配置 `DALAMUD_MANIFEST_TOKEN` 后才会创建 PR；目标仓库默认是 `irimsky/DalamudPlugins`，仓库变量仅用于覆盖默认值。
 
 当前状态：CI workflow 已提交，但尚未在 GitHub Actions 中实际运行；插件也尚未完成游戏内加载、重载、卸载、登出、切地图、依赖失效和完整战斗流程验证。
