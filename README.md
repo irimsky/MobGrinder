@@ -78,6 +78,7 @@ MobGrinder 是一个面向《最终幻想 XIV》的 Dalamud 自动化插件，�
 - vnavmesh 或 Lifestream 不可用时，相关流程会暂停或停止；请先确认依赖状态正常。
 - MobGrinder 只负责目标和流程控制，实际战斗行为完全依赖外部战斗插件。
 - 游戏更新可能改变 Dalamud、IPC、对象识别或导航行为；遇到异常时请先查看 `/mg log` 的诊断信息。
+- 因不明原因，部分野怪的静态刷新点在客户端数据中可能为空；如有需要，可根据 Wiki 数据手动补充到 `MobGrinder/Data/MobSpawnSupplementData.cs` 的 `MobSpawnSupplementData.Entries` 集合中。目前该集合已录入 7.0 幻武所需野怪的刷新点。
 
 ## 许可证
 
