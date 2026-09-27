@@ -93,6 +93,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private DateTime nextNavigationSnapshotAt = DateTime.MinValue;
     private DateTime lastAggroSeenAt = DateTime.MinValue;
     private DateTime combatBecameIdleAt = DateTime.MinValue;
+    private DateTime nextCycleStartAt = DateTime.MinValue;
     private IReadOnlyList<MobSnapshot> mobs = [];
     private IReadOnlyList<Vector3> spawnPoints = [];
     private List<RuntimeTargetProgress> targetProgress = [];
@@ -1086,21 +1087,38 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private void AdvanceTarget(DateTime now)
     {
         MobGrinderPreset preset = this.configuration.GetActivePresetList();
-        this.RefreshTargetProgress();
-        if (this.targetProgress.All(progress => progress.IsCompleted))
+        if (this.nextCycleStartAt != DateTime.MinValue)
         {
-            this.PlayCycleCompletedSound();
-            if (this.configuration.RunMode == MobRunMode.StopAfterOneCycle)
+            if (now < this.nextCycleStartAt)
             {
-                this.FinishCycle();
+                this.StatusReason = "本轮预设已完成，准备开始下一轮";
                 return;
             }
 
             this.InitializeTargetProgress();
+            this.nextCycleStartAt = DateTime.MinValue;
             this.targetIndex = 0;
         }
         else
         {
+            this.RefreshTargetProgress();
+            if (this.targetProgress.All(progress => progress.IsCompleted))
+            {
+                this.PlayCycleCompletedSound();
+                if (this.configuration.RunMode == MobRunMode.StopAfterOneCycle)
+                {
+                    this.FinishCycle();
+                    return;
+                }
+
+                // Keep the completed counts visible in the overlay before resetting the
+                // progress for the next loop. Without this pause a one-target loop appears
+                // to remain at 0 forever because reset and redraw happen in the same tick.
+                this.nextCycleStartAt = now.AddSeconds(1);
+                this.StatusReason = "本轮预设已完成，准备开始下一轮";
+                return;
+            }
+
             this.targetIndex = (this.targetIndex + 1) % preset.Targets.Count;
             if (!this.TrySelectNextIncompleteTarget())
                 return;
@@ -1738,6 +1756,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.teleportPlan = null;
         this.teleportRequestedAt = DateTime.MinValue;
         this.teleportCompletedAt = DateTime.MinValue;
+        this.nextCycleStartAt = DateTime.MinValue;
         this.EndTravelSession();
         this.landing.StopDescending();
     }
