@@ -1,0 +1,108 @@
+name: Pull Request Build
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dalamud_region:
+        description: Dalamud runtime region
+        required: true
+        default: cn
+        type: choice
+        options: [cn, global]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: 10.0.400
+  DALAMUD_REGION: ${{ inputs.dalamud_region || vars.MOBGRINDER_DALAMUD_REGION || 'cn' }}
+  DALAMUD_CUSTOM_RUNTIME_URL: ${{ vars.MOBGRINDER_DALAMUD_RUNTIME_URL }}
+  DALAMUD_CUSTOM_RUNTIME_SHA256: ${{ vars.MOBGRINDER_DALAMUD_RUNTIME_SHA256 }}
+  DALAMUD_CN_RUNTIME_URL: https://github.com/Dalamud-DailyRoutines/Dalamud/releases/latest/download/latest.7z
+  DALAMUD_GLOBAL_RUNTIME_URL: https://goatcorp.github.io/dalamud-distrib/latest.zip
+
+jobs:
+  build:
+    name: Build, test and verify plugin
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Initialize FieldNavigation submodule
+        shell: pwsh
+        run: |
+          git config submodule.MobGrinder/external/FieldNavigation.url https://github.com/irimsky/FieldNavigation.git
+          git submodule update --init --recursive
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: .nuget
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json', 'global.json', 'Directory.Build.props', 'Directory.Build.targets') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Download Dalamud runtime
+        shell: pwsh
+        env:
+          RUNTIME_DIRECTORY: ${{ github.workspace }}\.dalamud-runtime
+        run: |
+          $region = $env:DALAMUD_REGION.Trim().ToLowerInvariant()
+          $runtimeUrl = if ($region -eq 'cn') { $env:DALAMUD_CN_RUNTIME_URL } elseif ($region -eq 'global') { $env:DALAMUD_GLOBAL_RUNTIME_URL } else { throw "Unsupported Dalamud region: $region" }
+          $expectedHash = $env:DALAMUD_CUSTOM_RUNTIME_SHA256
+          if (-not [string]::IsNullOrWhiteSpace($env:DALAMUD_CUSTOM_RUNTIME_URL)) { $runtimeUrl = $env:DALAMUD_CUSTOM_RUNTIME_URL }
+          $extension = if ($runtimeUrl -match '\.7z(?:\?|$)') { '.7z' } else { '.zip' }
+          $archive = Join-Path $env:RUNNER_TEMP "mobgrinder-dalamud$extension"
+          Invoke-WebRequest -Uri $runtimeUrl -OutFile $archive
+          if (-not [string]::IsNullOrWhiteSpace($expectedHash)) {
+            $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash.Trim().ToLowerInvariant()) { throw "Dalamud runtime SHA-256 mismatch: $actualHash" }
+          }
+          if (Test-Path -LiteralPath $env:RUNTIME_DIRECTORY) { Remove-Item -LiteralPath $env:RUNTIME_DIRECTORY -Recurse -Force }
+          if ($extension -eq '.7z') {
+            $sevenZip = (Get-Command 7z.exe, 7z -ErrorAction Stop | Select-Object -First 1).Source
+            & $sevenZip x $archive "-o$env:RUNTIME_DIRECTORY" -y
+            if ($LASTEXITCODE -ne 0) { throw "7z extraction failed: $LASTEXITCODE" }
+          } else { Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNTIME_DIRECTORY -Force }
+          $assembly = Get-ChildItem -LiteralPath $env:RUNTIME_DIRECTORY -Filter Dalamud.dll -File -Recurse | Select-Object -First 1
+          if ($null -eq $assembly) { throw 'Downloaded runtime does not contain Dalamud.dll.' }
+          "DALAMUD_RUNTIME_PATH=$($assembly.Directory.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Release
+        shell: pwsh
+        run: .\build.ps1 -Configuration Release -Restore -LockedMode -DalamudLibPath "$env:DALAMUD_RUNTIME_PATH"
+
+      - name: Restore test project
+        shell: pwsh
+        run: dotnet restore .\MobGrinder.Tests\MobGrinder.Tests.csproj --packages .\.nuget -p:DalamudLibPath="$env:DALAMUD_RUNTIME_PATH"
+
+      - name: Run unit tests
+        shell: pwsh
+        run: dotnet test .\MobGrinder.Tests\MobGrinder.Tests.csproj -c Release --no-restore -p:DalamudLibPath="$env:DALAMUD_RUNTIME_PATH" --logger "trx;LogFileName=MobGrinder.Tests.trx" --results-directory TestResults
+
+      - name: Verify plugin package
+        shell: pwsh
+        run: .\tools\Test-PluginPackage.ps1 -PackagePath .\MobGrinder\bin\Release\MobGrinder\latest.zip
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobGrinder-pr-${{ github.run_number }}
+          path: |
+            MobGrinder/bin/Release/MobGrinder/latest.zip
+            TestResults/*.trx
+          if-no-files-found: ignore

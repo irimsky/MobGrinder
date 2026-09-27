@@ -1,0 +1,35 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <MobGrinderUsesDalamud>true</MobGrinderUsesDalamud>
+    <AssemblyName>MobGrinder</AssemblyName>
+    <RootNamespace>MobGrinder</RootNamespace>
+    <Version>0.1.0.0</Version>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <PlatformTarget>x64</PlatformTarget>
+    <Platforms>x64</Platforms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DebugType>portable</DebugType>
+    <DebugSymbols>true</DebugSymbols>
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LuminaSupplemental.Excel" Version="5.1.2" />
+  </ItemGroup>
+
+  <Target Name="RequireFieldNavigationSubmodule" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('external/FieldNavigation/NoFlyZone.cs')"
+           Text="FieldNavigation submodule is missing. Run git submodule update --init --recursive (for the local sibling repository, add -c protocol.file.allow=always)." />
+  </Target>
+
+  <ItemGroup>
+    <None Update="MobGrinder.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+</Project>

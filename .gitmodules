@@ -1,0 +1,3 @@
+[submodule "MobGrinder/external/FieldNavigation"]
+	path = MobGrinder/external/FieldNavigation
+	url = https://github.com/irimsky/FieldNavigation.git

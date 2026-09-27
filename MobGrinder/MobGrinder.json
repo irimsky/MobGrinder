@@ -1,0 +1,15 @@
+{
+  "Author": "MobGrinder",
+  "Name": "MobGrinder",
+  "Punchline": "按预设自动巡回刷指定野怪",
+  "Description": "按预设传送到地图、飞往静态刷新点并在目标出现时交给其他战斗插件处理。导航使用 vnavmesh，传送使用 Lifestream。使用 /mobgrinder 打开设置。",
+  "InternalName": "MobGrinder",
+  "ApplicableVersion": "any",
+  "DalamudApiLevel": 15,
+  "LoadRequiredState": 1,
+  "LoadSync": false,
+  "CanUnloadAsync": true,
+  "Tags": ["Automation", "Combat", "Mob"],
+  "IconUrl": "https://raw.githubusercontent.com/irimsky/MobGrinder/main/images/icon.png",
+  "Changelog": "完善配置迁移、生命周期清理、测试与发布验证链。"
+}

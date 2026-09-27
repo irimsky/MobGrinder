@@ -1,0 +1,14 @@
+bin/
+obj/
+.dotnet-home/
+.nuget/
+.dotnet/
+.dalamud/
+.dalamud-runtime/
+.dalamud-runtime.7z
+TestResults/
+.vs/
+*.log
+*.tmp
+*.user
+*.suo

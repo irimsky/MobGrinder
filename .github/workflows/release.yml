@@ -1,0 +1,214 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+      - '*.*.*.*'
+      - 'v*.*.*'
+      - 'v*.*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag, for example v0.1.0
+        required: true
+        type: string
+      dalamud_region:
+        description: Dalamud runtime region
+        required: true
+        default: cn
+        type: choice
+        options: [cn, global]
+      manifest_update:
+        description: Update the external Dalamud manifest through a pull request
+        required: true
+        default: skip
+        type: choice
+        options: [pr, skip]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_VERSION: 10.0.400
+  DALAMUD_REGION: ${{ inputs.dalamud_region || vars.MOBGRINDER_DALAMUD_REGION || 'cn' }}
+  DALAMUD_CUSTOM_RUNTIME_URL: ${{ vars.MOBGRINDER_DALAMUD_RUNTIME_URL }}
+  DALAMUD_CUSTOM_RUNTIME_SHA256: ${{ vars.MOBGRINDER_DALAMUD_RUNTIME_SHA256 }}
+  DALAMUD_CN_RUNTIME_URL: https://github.com/Dalamud-DailyRoutines/Dalamud/releases/latest/download/latest.7z
+  DALAMUD_GLOBAL_RUNTIME_URL: https://goatcorp.github.io/dalamud-distrib/latest.zip
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+      assembly_version: ${{ steps.version.outputs.assembly_version }}
+      release_url: ${{ steps.publish.outputs.release_url }}
+      download_count: ${{ steps.publish.outputs.download_count }}
+      last_update: ${{ steps.publish.outputs.last_update }}
+      update_manifest: ${{ github.event_name == 'workflow_dispatch' && inputs.manifest_update == 'pr' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Initialize FieldNavigation submodule
+        shell: pwsh
+        run: |
+          git config submodule.MobGrinder/external/FieldNavigation.url https://github.com/irimsky/FieldNavigation.git
+          git submodule update --init --recursive
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: .nuget
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json', 'global.json', 'Directory.Build.props', 'Directory.Build.targets') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Download Dalamud runtime
+        shell: pwsh
+        env:
+          RUNTIME_DIRECTORY: ${{ github.workspace }}\.dalamud-runtime
+        run: |
+          $region = $env:DALAMUD_REGION.Trim().ToLowerInvariant()
+          $runtimeUrl = if ($region -eq 'cn') { $env:DALAMUD_CN_RUNTIME_URL } elseif ($region -eq 'global') { $env:DALAMUD_GLOBAL_RUNTIME_URL } else { throw "Unsupported Dalamud region: $region" }
+          $expectedHash = $env:DALAMUD_CUSTOM_RUNTIME_SHA256
+          if (-not [string]::IsNullOrWhiteSpace($env:DALAMUD_CUSTOM_RUNTIME_URL)) { $runtimeUrl = $env:DALAMUD_CUSTOM_RUNTIME_URL }
+          $extension = if ($runtimeUrl -match '\.7z(?:\?|$)') { '.7z' } else { '.zip' }
+          $archive = Join-Path $env:RUNNER_TEMP "mobgrinder-dalamud$extension"
+          Invoke-WebRequest -Uri $runtimeUrl -OutFile $archive
+          if (-not [string]::IsNullOrWhiteSpace($expectedHash)) {
+            $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHash.Trim().ToLowerInvariant()) { throw "Dalamud runtime SHA-256 mismatch: $actualHash" }
+          }
+          if (Test-Path -LiteralPath $env:RUNTIME_DIRECTORY) { Remove-Item -LiteralPath $env:RUNTIME_DIRECTORY -Recurse -Force }
+          if ($extension -eq '.7z') {
+            $sevenZip = (Get-Command 7z.exe, 7z -ErrorAction Stop | Select-Object -First 1).Source
+            & $sevenZip x $archive "-o$env:RUNTIME_DIRECTORY" -y
+            if ($LASTEXITCODE -ne 0) { throw "7z extraction failed: $LASTEXITCODE" }
+          } else { Expand-Archive -LiteralPath $archive -DestinationPath $env:RUNTIME_DIRECTORY -Force }
+          $assembly = Get-ChildItem -LiteralPath $env:RUNTIME_DIRECTORY -Filter Dalamud.dll -File -Recurse | Select-Object -First 1
+          if ($null -eq $assembly) { throw 'Downloaded runtime does not contain Dalamud.dll.' }
+          "DALAMUD_RUNTIME_PATH=$($assembly.Directory.FullName)" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Release and tests
+        shell: pwsh
+        run: |
+          .\build.ps1 -Configuration Release -Restore -LockedMode -DalamudLibPath "$env:DALAMUD_RUNTIME_PATH"
+          dotnet restore .\MobGrinder.Tests\MobGrinder.Tests.csproj --packages .\.nuget -p:DalamudLibPath="$env:DALAMUD_RUNTIME_PATH"
+          dotnet test .\MobGrinder.Tests\MobGrinder.Tests.csproj -c Release --no-restore -p:DalamudLibPath="$env:DALAMUD_RUNTIME_PATH" --logger "trx;LogFileName=MobGrinder.Tests.trx" --results-directory TestResults
+          .\tools\Test-PluginPackage.ps1 -PackagePath .\MobGrinder\bin\Release\MobGrinder\latest.zip
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobGrinder-release-tests-${{ inputs.tag || github.ref_name }}
+          path: TestResults/*.trx
+          if-no-files-found: ignore
+
+      - name: Validate version
+        id: version
+        shell: pwsh
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $tag = $env:RELEASE_TAG_INPUT.Trim()
+          if ($tag -notmatch '^v?\d+\.\d+\.\d+(\.\d+)?$') { throw "Invalid release tag: $tag" }
+          $text = Get-Content .\MobGrinder\MobGrinder.csproj -Raw
+          $match = [regex]::Match($text, '<Version>(?<version>[^<]+)</Version>')
+          if (-not $match.Success) { throw 'Project version is missing.' }
+          $tagParts = @($tag.TrimStart('v','V').Split('.') | ForEach-Object { [int]$_ })
+          $projectParts = @($match.Groups['version'].Value.Split('.') | ForEach-Object { [int]$_ })
+          while ($tagParts.Count -lt 4) { $tagParts += 0 }
+          while ($projectParts.Count -lt 4) { $projectParts += 0 }
+          if (($tagParts -join '.') -ne ($projectParts -join '.')) { throw "Tag $tag does not match project version $($match.Groups['version'].Value)." }
+          "release_version=$tag" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "assembly_version=$($match.Groups['version'].Value)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Publish GitHub release
+        id: publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.release_version }}
+          ASSEMBLY_VERSION: ${{ steps.version.outputs.assembly_version }}
+        run: |
+          $package = Join-Path $PWD 'MobGrinder\bin\Release\MobGrinder\latest.zip'
+          gh release view $env:RELEASE_VERSION --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_VERSION $package --repo $env:GITHUB_REPOSITORY --clobber
+            gh release edit $env:RELEASE_VERSION --repo $env:GITHUB_REPOSITORY --title "MobGrinder $env:RELEASE_VERSION"
+          } else {
+            gh release create $env:RELEASE_VERSION $package --repo $env:GITHUB_REPOSITORY --title "MobGrinder $env:RELEASE_VERSION" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_VERSION" | ConvertFrom-Json
+          $downloads = [long]0
+          foreach ($asset in @($release.assets)) { $downloads += [long]$asset.download_count }
+          "release_url=$($release.html_url)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "download_count=$downloads" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "last_update=$([DateTimeOffset]::Parse($release.published_at).ToUnixTimeSeconds())" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+  manifest-pr:
+    name: Open external manifest pull request
+    needs: release
+    if: needs.release.result == 'success' && needs.release.outputs.update_manifest == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout plugin repository
+        uses: actions/checkout@v4
+        with:
+          path: mobgrinder
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Checkout external manifest repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MOBGRINDER_MANIFEST_REPOSITORY }}
+          token: ${{ secrets.DALAMUD_MANIFEST_TOKEN }}
+          path: manifest
+      - name: Update manifest entry
+        shell: pwsh
+        working-directory: manifest
+        env:
+          REPOSITORY_NAME: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
+          ASSEMBLY_VERSION: ${{ needs.release.outputs.assembly_version }}
+          DOWNLOAD_COUNT: ${{ needs.release.outputs.download_count }}
+          LAST_UPDATE: ${{ needs.release.outputs.last_update }}
+        run: |
+          ..\mobgrinder\tools\Update-Manifest.ps1 -ManifestPath .\manifest.json -PluginManifestPath ..\mobgrinder\MobGrinder\MobGrinder.json -RepositoryUrl "https://github.com/$env:REPOSITORY_NAME" -AssemblyVersion $env:ASSEMBLY_VERSION -ReleaseTag $env:RELEASE_VERSION -DownloadCount $env:DOWNLOAD_COUNT -LastUpdate $env:LAST_UPDATE
+          git diff --check
+      - name: Create manifest pull request
+        shell: pwsh
+        working-directory: manifest
+        env:
+          GH_TOKEN: ${{ secrets.DALAMUD_MANIFEST_TOKEN }}
+          MANIFEST_REPOSITORY: ${{ vars.MOBGRINDER_MANIFEST_REPOSITORY }}
+          RELEASE_VERSION: ${{ needs.release.outputs.release_version }}
+          RELEASE_URL: ${{ needs.release.outputs.release_url }}
+        run: |
+          $branch = "mobgrinder/release-$env:RELEASE_VERSION"
+          git checkout -b $branch
+          git config user.name 'MobGrinder Release Bot'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add manifest.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { Write-Host 'Manifest already contains this release.'; exit 0 }
+          git commit -m "Update MobGrinder $env:RELEASE_VERSION manifest"
+          git push origin "HEAD:$branch"
+          gh pr create --repo $env:MANIFEST_REPOSITORY --head $branch --base main --title "Update MobGrinder $env:RELEASE_VERSION manifest" --body "Automated manifest update for [MobGrinder $env:RELEASE_VERSION]($env:RELEASE_URL)."

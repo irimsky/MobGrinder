@@ -1,0 +1,26 @@
+<Project>
+  <PropertyGroup Condition="'$(MobGrinderUsesDalamud)' == 'true'">
+    <_MobGrinderRuntimePath>$(MOBGRINDER_DALAMUD_LIB_PATH)</_MobGrinderRuntimePath>
+    <_MobGrinderRuntimePath Condition="'$(_MobGrinderRuntimePath)' == ''">$(DALAMUD_LIB_PATH)</_MobGrinderRuntimePath>
+    <_MobGrinderRuntimePath Condition="'$(_MobGrinderRuntimePath)' == ''">$(DALAMUD_HOME)</_MobGrinderRuntimePath>
+    <_MobGrinderRuntimePath Condition="'$(_MobGrinderRuntimePath)' == '' and Exists('$(APPDATA)/XIVLauncherCN/addon/Hooks/dev/Dalamud.dll')">$(APPDATA)/XIVLauncherCN/addon/Hooks/dev</_MobGrinderRuntimePath>
+    <_MobGrinderRuntimePath Condition="'$(_MobGrinderRuntimePath)' == '' and Exists('$(APPDATA)/XIVLauncher/addon/Hooks/dev/Dalamud.dll')">$(APPDATA)/XIVLauncher/addon/Hooks/dev</_MobGrinderRuntimePath>
+    <DalamudLibPath Condition="'$(_MobGrinderRuntimePath)' != ''">$(_MobGrinderRuntimePath)</DalamudLibPath>
+    <AssemblySearchPaths>$(AssemblySearchPaths);$(DalamudLibPath)</AssemblySearchPaths>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(MobGrinderUsesDalamud)' == 'true' and '$(DalamudLibPath)' != ''">
+    <Reference Update="Dalamud;Dalamud.Bindings.ImGui;Dalamud.Bindings.ImPlot;Dalamud.Bindings.ImGuizmo;FFXIVClientStructs;InteropGenerator.Runtime;Newtonsoft.Json;Lumina;Lumina.Excel;Serilog;Microsoft.Extensions.ObjectPool">
+      <HintPath>$(DalamudLibPath)/%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateMobGrinderDalamudRuntime"
+          BeforeTargets="BeforeBuild"
+          Condition="'$(MobGrinderUsesDalamud)' == 'true'">
+    <Error Condition="'$(DalamudLibPath)' == '' or !Exists('$(DalamudLibPath)/Dalamud.dll')"
+           Text="找不到 Dalamud.dll。请传入 -p:DalamudLibPath，或设置 MOBGRINDER_DALAMUD_LIB_PATH、DALAMUD_LIB_PATH、DALAMUD_HOME。当前路径：$(DalamudLibPath)" />
+    <Message Text="MobGrinder Dalamud runtime: $(DalamudLibPath)" Importance="high" />
+  </Target>
+</Project>
