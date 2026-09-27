@@ -56,7 +56,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          # Manual runs use the selected workflow branch as the source of the
+          # package and manifest metadata; tag is the release identity.
+          # Tag-triggered runs still use the pushed tag through github.ref.
+          ref: ${{ github.ref }}
           fetch-depth: 0
 
       - name: Initialize FieldNavigation submodule
@@ -175,7 +178,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: mobgrinder
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ github.ref }}
       - name: Checkout external manifest repository
         uses: actions/checkout@v4
         with:
