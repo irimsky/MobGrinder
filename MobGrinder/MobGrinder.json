@@ -1,8 +1,8 @@
 {
-  "Author": "MobGrinder",
+  "Author": "irimsky",
   "Name": "MobGrinder",
-  "Punchline": "按预设自动巡回刷指定野怪",
-  "Description": "按预设传送到地图、飞往静态刷新点并在目标出现时交给其他战斗插件处理。导航使用 vnavmesh，传送使用 Lifestream。使用 /mobgrinder 打开设置。",
+  "Punchline": "自动传送、跑图并刷够指定数量的野怪",
+  "Description": "按预设传送到地图，骑鸟或飞行前往刷怪点；发现目标野怪就接战，并按击杀数或物品数量自动换下一个目标。战斗技能交给外部职业循环插件。使用 /mobgrinder 或 /mg 打开窗口。",
   "InternalName": "MobGrinder",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
