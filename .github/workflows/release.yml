@@ -217,7 +217,17 @@ jobs:
             throw 'Failed to create the external manifest pull request.'
           }
           $prUrl = ($prUrl | Select-Object -Last 1).ToString().Trim()
-          gh pr merge $prUrl --repo $env:MANIFEST_REPOSITORY --auto --squash --delete-branch
+          $mergeOutput = gh pr merge $prUrl --repo $env:MANIFEST_REPOSITORY --auto --squash --delete-branch 2>&1
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to enable auto-merge for manifest pull request: $prUrl"
+            $mergeMessage = $mergeOutput | Out-String
+            if ($mergeMessage -notmatch 'in clean status|enablePullRequestAutoMerge') {
+              throw "Failed to merge manifest pull request: $prUrl`n$mergeMessage"
+            }
+
+            # A repository without required checks cannot enable auto-merge because the PR is
+            # already immediately mergeable. Fall back to a direct squash merge in that case.
+            gh pr merge $prUrl --repo $env:MANIFEST_REPOSITORY --squash --delete-branch
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to directly merge clean manifest pull request: $prUrl"
+            }
           }
