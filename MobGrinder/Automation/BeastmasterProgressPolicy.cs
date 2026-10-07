@@ -3,8 +3,6 @@ namespace MobGrinder;
 /// <summary>Test runs must defeat a target before consulting its bestiary state.</summary>
 public static class BeastmasterProgressPolicy
 {
-    public static bool ShouldRecordDefeat(bool wasEngaged, bool observedDeath) => wasEngaged && observedDeath;
-
     public static bool ShouldCheckUnlocks(bool testMode, int confirmedDefeats) =>
         !testMode || confirmedDefeats > 0;
 

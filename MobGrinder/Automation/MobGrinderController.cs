@@ -1404,18 +1404,29 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         if (now - this.combatBecameIdleAt < TimeSpan.FromSeconds(1))
             return;
 
-        int completedTargetIndex = this.selectedTargetIndex >= 0
-            ? this.selectedTargetIndex
-            : this.targetIndex;
+        int completedTargetIndex = this.selectedTargetIndex;
         if (completedTargetIndex >= 0 && completedTargetIndex < this.targetProgress.Count)
         {
             RuntimeTargetProgress progress = this.targetProgress[completedTargetIndex];
             if (!this.selectedTargetDefeatRecorded)
             {
-                bool confirmedDefeat = BeastmasterProgressPolicy.ShouldRecordDefeat(
+                bool confirmedDefeat = MobDefeatPolicy.ShouldRecordDefeat(
                     this.selectedTargetWasEngaged, this.selectedTargetDefeated);
-                if (!this.IsBeastmasterActive || confirmedDefeat)
-                    progress.KillCount++;
+                progress.KillCount = MobDefeatPolicy.RecordDefeat(progress.KillCount,
+                    this.selectedTargetWasEngaged, this.selectedTargetDefeated);
+                if (confirmedDefeat)
+                {
+                    this.AddDiagnostic(DiagnosticSeverity.Information,
+                        $"已确认击杀：{this.GetTargetDisplayName(progress.Target)}；对象 ID 0x{this.selectedTargetId:X}；"
+                        + $"{this.GetStopConditionProgress(progress.Target, progress.KillCount)}");
+                }
+                else
+                {
+                    this.AddDiagnostic(DiagnosticSeverity.Information,
+                        $"未计入击杀：{this.GetTargetDisplayName(progress.Target)}；对象 ID 0x{this.selectedTargetId:X}；"
+                        + $"已接战={this.selectedTargetWasEngaged}，已确认死亡={this.selectedTargetDefeated}；"
+                        + $"{this.GetStopConditionProgress(progress.Target, progress.KillCount)}");
+                }
                 this.selectedTargetDefeatRecorded = true;
                 if (this.IsBeastmasterActive && confirmedDefeat)
                 {
@@ -1430,7 +1441,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 }
             }
             progress.IsCompleted = this.AreStopConditionsMet(progress.Target, progress.KillCount);
-            if (this.IsBeastmasterActive && BeastmasterProgressPolicy.ShouldRecordDefeat(
+            if (this.IsBeastmasterActive && MobDefeatPolicy.ShouldRecordDefeat(
                     this.selectedTargetWasEngaged, this.selectedTargetDefeated))
                 this.AddDiagnostic(DiagnosticSeverity.Information,
                     $"战后图鉴确认 No.{progress.Target.BeastmasterPetId:00}："
