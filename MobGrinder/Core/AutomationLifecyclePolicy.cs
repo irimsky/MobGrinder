@@ -21,14 +21,14 @@ public static class AutomationLifecyclePolicy
         bool vnavmeshAvailable)
     {
         if (!isLoggedIn || !playerLoaded)
-            return new(true, false, true, "等待角色登录和对象表就绪；导航已停止");
+            return new(true, false, true, "等待角色登录并加载完成，已停止移动");
         if (betweenAreas)
-            return new(true, false, true, "区域切换中；导航已停止，等待新区域就绪");
+            return new(true, false, true, "正在切换地图，已停止移动并等待加载完成");
         if ((state is AutomationState.Teleporting or AutomationState.WaitingForTerritory)
             && !lifestreamAvailable)
-            return new(true, true, true, "Lifestream 在传送过程中失效，已停止自动流程");
+            return new(true, true, true, "传送期间 Lifestream 不可用，已停止运行");
         if (RequiresVnavmesh(state) && !vnavmeshAvailable)
-            return new(true, true, false, "vnavmesh 在导航过程中失效，已停止自动流程");
+            return new(true, true, false, "移动期间 vnavmesh 不可用，已停止运行");
         return default;
     }
 

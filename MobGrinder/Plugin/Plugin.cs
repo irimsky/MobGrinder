@@ -1,4 +1,6 @@
 using Dalamud.Game.Command;
+using Dalamud.Interface;
+using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -13,9 +15,12 @@ public sealed class Plugin : IAsyncDalamudPlugin
     private readonly MobGrinderConfiguration configuration;
     private readonly MobSpawnDataService spawnData;
     private readonly MobGrinderController controller;
+    private readonly MobGrinderIpcProvider ipcProvider;
     private readonly MobGrinderWindow window;
     private readonly MobGrinderOverlayWindow overlayWindow;
     private readonly MobGrinderLogWindow logWindow;
+    private readonly MobGrinderSettingsWindow settingsWindow;
+    private readonly IFontHandle uiFont;
     private readonly WindowSystem windowSystem = new("MobGrinder");
 
     public Plugin(
@@ -25,6 +30,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
         IFramework framework,
         IClientState clientState,
         IPlayerState playerState,
+        IUnlockState unlockState,
         IObjectTable objectTable,
         ITargetManager targetManager,
         ICondition condition,
@@ -47,6 +53,9 @@ public sealed class Plugin : IAsyncDalamudPlugin
         bool shortCommandRegistered = false;
         MobGrinderWindow? window = null;
         MobGrinderOverlayWindow? overlayWindow = null;
+        MobGrinderSettingsWindow? settingsWindow = null;
+        MobGrinderIpcProvider? ipcProvider = null;
+        IFontHandle? uiFont = null;
 
         try
         {
@@ -87,30 +96,37 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 landing,
                 soundAlerts,
                 noFlyZones,
-                nativeGameState);
+                nativeGameState,
+                new BeastmasterGameAdapter(dataManager, unlockState));
+            ipcProvider = new MobGrinderIpcProvider(this.pluginInterface, controller, log);
 
             MobGrinderLogWindow logWindow = new(controller);
+            this.uiFont = uiFont = pluginInterface.UiBuilder.FontAtlas.NewDelegateFontHandle(
+                step => step.OnPreBuild(toolkit => toolkit.AddDalamudDefaultFont(UiBuilder.DefaultFontSizePx + 2f)));
             window = new(
                 this.configuration,
                 controller,
                 this.SaveConfiguration,
                 logWindow.Open,
-                visible => overlayWindow?.SetVisible(visible));
+                visible => overlayWindow?.SetVisible(visible),
+                () => settingsWindow?.Open());
+            this.settingsWindow = settingsWindow = new(window.DrawSettingsPage);
             overlayWindow = new(this.pluginInterface, this.configuration, window);
             this.windowSystem.AddWindow(window);
             this.windowSystem.AddWindow(overlayWindow);
             this.windowSystem.AddWindow(logWindow);
+            this.windowSystem.AddWindow(settingsWindow);
 
-            this.pluginInterface.UiBuilder.Draw += this.windowSystem.Draw;
+            this.pluginInterface.UiBuilder.Draw += this.DrawUi;
             drawRegistered = true;
             this.pluginInterface.UiBuilder.OpenMainUi += window.Open;
             mainUiRegistered = true;
-            this.pluginInterface.UiBuilder.OpenConfigUi += window.Open;
+            this.pluginInterface.UiBuilder.OpenConfigUi += this.OpenSettingsWindow;
             configUiRegistered = true;
 
             CommandInfo command = new(this.OnCommand)
             {
-                HelpMessage = "打开 MobGrinder；start|pause|stop|scan|status|log|ui",
+                HelpMessage = "打开 MobGrinder；start|pause|stop|scan|status|log|ui|config",
                 ShowInHelp = true,
             };
             if (!this.commandManager.AddHandler("/mobgrinder", command))
@@ -124,6 +140,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
             landing.Enable();
 
             this.controller = controller!;
+            this.ipcProvider = ipcProvider!;
             this.window = window!;
             this.overlayWindow = overlayWindow!;
             this.logWindow = logWindow;
@@ -136,12 +153,14 @@ public sealed class Plugin : IAsyncDalamudPlugin
             if (primaryCommandRegistered)
                 this.commandManager.RemoveHandler("/mobgrinder");
             if (configUiRegistered && window is not null)
-                this.pluginInterface.UiBuilder.OpenConfigUi -= window.Open;
+                this.pluginInterface.UiBuilder.OpenConfigUi -= this.OpenSettingsWindow;
             if (mainUiRegistered && window is not null)
                 this.pluginInterface.UiBuilder.OpenMainUi -= window.Open;
             if (drawRegistered)
-                this.pluginInterface.UiBuilder.Draw -= this.windowSystem.Draw;
+                this.pluginInterface.UiBuilder.Draw -= this.DrawUi;
             this.windowSystem.RemoveAllWindows();
+            uiFont?.Dispose();
+            ipcProvider?.Dispose();
             controller?.Dispose();
             landing?.Dispose();
             throw;
@@ -154,10 +173,12 @@ public sealed class Plugin : IAsyncDalamudPlugin
     {
         this.commandManager.RemoveHandler("/mobgrinder");
         this.commandManager.RemoveHandler("/mg");
-        this.pluginInterface.UiBuilder.Draw -= this.windowSystem.Draw;
+        this.pluginInterface.UiBuilder.Draw -= this.DrawUi;
         this.pluginInterface.UiBuilder.OpenMainUi -= this.window.Open;
-        this.pluginInterface.UiBuilder.OpenConfigUi -= this.window.Open;
+        this.pluginInterface.UiBuilder.OpenConfigUi -= this.OpenSettingsWindow;
         this.windowSystem.RemoveAllWindows();
+        this.uiFont.Dispose();
+        this.ipcProvider.Dispose();
         await this.controller.DisposeAsync().ConfigureAwait(false);
         this.SaveConfiguration();
     }
@@ -168,8 +189,10 @@ public sealed class Plugin : IAsyncDalamudPlugin
         {
             case "":
             case "ui":
-            case "config":
                 this.window.Open();
+                break;
+            case "config":
+                this.OpenSettingsWindow();
                 break;
             case "start":
                 this.controller.Start();
@@ -185,7 +208,7 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 break;
             case "status":
                 this.log.Information(
-                    "MobGrinder 状态：{State}；{Reason}；候选野怪={Count}",
+                    "MobGrinder 状态：{State}；{Reason}；周边野怪={Count}",
                     this.controller.State,
                     this.controller.StatusReason,
                     this.controller.Mobs.Count);
@@ -194,9 +217,17 @@ public sealed class Plugin : IAsyncDalamudPlugin
                 this.logWindow.Open();
                 break;
             default:
-                this.log.Warning("未知 MobGrinder 命令：{Command}；可用命令：start、pause、stop、scan、status、log、ui", args.Trim());
+                this.log.Warning("未知 MobGrinder 命令：{Command}；可用命令：start、pause、stop、scan、status、log、ui、config", args.Trim());
                 break;
         }
+    }
+
+    private void OpenSettingsWindow() => this.settingsWindow.Open();
+
+    private void DrawUi()
+    {
+        using (this.uiFont.Push())
+            this.windowSystem.Draw();
     }
 
     private void SaveConfiguration() => this.pluginInterface.SavePluginConfig(this.configuration);

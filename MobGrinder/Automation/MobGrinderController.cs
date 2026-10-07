@@ -10,8 +10,8 @@ using Dalamud.Plugin.Services;
 namespace MobGrinder;
 
 /// <summary>
-/// Framework-thread state machine for named-mob navigation. The combat rotation remains owned by
-/// another plugin; this controller only selects targets, moves, and waits for a clean aggro state.
+/// Framework-thread state machine for named-mob navigation and Beastmaster capture.
+/// Regular combat rotations remain owned by another plugin.
 /// </summary>
 public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 {
@@ -70,8 +70,37 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private readonly LandingAdapter landing;
     private readonly FieldNavigation.NoFlyZoneCatalog noFlyZones;
     private readonly FieldNavigation.NavigationTravelSession travelSession;
+    private readonly CombatLandingSession combatLanding;
     private readonly SoundAlertAdapter soundAlerts;
     private readonly NativeGameStateAdapter nativeGameState;
+    private readonly BeastmasterGameAdapter beastmasterGame;
+    private readonly BeastmasterCombatPolicy beastmasterCombat = new();
+    private readonly BeastmasterComboPolicy beastmasterCombo = new();
+    private MobGrinderPreset? beastmasterPlan;
+    private bool beastmasterTestMode;
+    private ulong beastmasterContentId;
+    private IReadOnlySet<uint> beastmasterUnlocks = new HashSet<uint>();
+    private DateTime nextBeastmasterSyncAt;
+    private DateTime beastmasterDataWaitStartedAt;
+    private DateTime nextBeastmasterActionAt;
+    public bool BeastmasterDataReady { get; private set; }
+    public string BeastmasterDataStatus { get; private set; } = "等待角色和图鉴加载";
+    public IReadOnlySet<uint> BeastmasterUnlockedPets => this.beastmasterUnlocks;
+    public bool IsBeastmasterActive => this.beastmasterPlan is not null;
+    public bool IsBeastmasterTestActive => this.IsBeastmasterActive && this.beastmasterTestMode;
+    private AutomationRunKind ActiveRunKind => this.IsBeastmasterTestActive ? AutomationRunKind.BeastmasterTest
+        : this.IsBeastmasterActive ? AutomationRunKind.Beastmaster : AutomationRunKind.Regular;
+    public bool CanStartBeastmaster(bool testMode) => !this.singleTargetActive
+        && AutomationStartPolicy.CanStart(this.State, this.ActiveRunKind,
+            testMode ? AutomationRunKind.BeastmasterTest : AutomationRunKind.Beastmaster);
+    private bool ShouldCheckBeastmasterUnlocks => !this.IsBeastmasterActive
+        || BeastmasterProgressPolicy.ShouldCheckUnlocks(this.beastmasterTestMode, this.GetCurrentTargetKillCount());
+    private MobGrinderPreset GetActivePlan() => this.beastmasterPlan ?? this.configuration.GetActivePresetList();
+    private MobRunMode ActiveRunMode => this.IsBeastmasterActive ? MobRunMode.StopAfterOneCycle : this.configuration.RunMode;
+
+    private bool MatchesTarget(MobTargetPreset target, uint nameId) => target.BeastmasterPetId == 0
+        ? target.BNpcNameId == nameId
+        : BeastmasterCatalog.Entries.First(entry => entry.Number == target.BeastmasterPetId).NameIds.Contains(nameId);
     private readonly Queue<DiagnosticEntry> diagnostics = new();
     private readonly object diagnosticsLock = new();
     private readonly CancellationTokenSource shutdown = new();
@@ -104,10 +133,13 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private ulong selectedTargetId;
     private int selectedTargetIndex = -1;
     private bool selectedTargetWasEngaged;
+    private bool selectedTargetDefeated;
+    private bool selectedTargetDefeatRecorded;
     private bool targetInterruptedBeforeArrival;
     private bool forceCombatReposition;
     private bool combatRepositionAttempted;
     private TargetApproachMode targetApproachMode;
+    private MobTargetApproach targetApproach;
     private readonly HashSet<ulong> skippedTargetObjectIds = [];
     private bool travelSessionActive;
     private string travelContext = string.Empty;
@@ -119,6 +151,11 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private bool walkSprintAttempted;
     private AetheryteTravelPlan? teleportPlan;
     private AutomationState pausedFromState = AutomationState.ValidatingPlan;
+    private bool singleTargetActive;
+    private int singleTargetPreviousPresetIndex;
+    private MobRunMode singleTargetPreviousRunMode;
+    private MobGrinderPreset? singleTargetPreset;
+    private string singleTargetResult = "None";
 
     public MobGrinderController(
         MobGrinderConfiguration configuration,
@@ -139,7 +176,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         LandingAdapter landing,
         SoundAlertAdapter soundAlerts,
         FieldNavigation.NoFlyZoneCatalog noFlyZones,
-        NativeGameStateAdapter nativeGameState)
+        NativeGameStateAdapter nativeGameState,
+        BeastmasterGameAdapter beastmasterGame)
     {
         this.configuration = configuration;
         this.log = log;
@@ -160,12 +198,16 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.soundAlerts = soundAlerts;
         this.noFlyZones = noFlyZones;
         this.nativeGameState = nativeGameState;
+        this.beastmasterGame = beastmasterGame;
         this.travelSession = new FieldNavigation.NavigationTravelSession(vnavmesh, landing, mount);
+        this.combatLanding = new CombatLandingSession(vnavmesh, landing);
         this.framework.Update += this.OnFrameworkUpdate;
     }
 
     public AutomationState State { get; private set; } = AutomationState.Stopped;
-    public bool CanStart => this.State is AutomationState.Stopped or AutomationState.Paused;
+    public bool CanStart => !this.IsBeastmasterActive
+        && AutomationStartPolicy.CanStart(this.State, this.ActiveRunKind, AutomationRunKind.Regular);
+    public bool CanStartCurrent => AutomationStartPolicy.CanStart(this.State, this.ActiveRunKind, this.ActiveRunKind);
     public bool CanPause => this.State is not (AutomationState.Stopped or AutomationState.Paused);
     public bool CanStop => this.State != AutomationState.Stopped;
     public string StatusReason { get; private set; } = "尚未启动";
@@ -180,6 +222,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     public bool VnavmeshAvailable => this.vnavmesh.IsAvailable;
     public bool LifestreamAvailable => this.lifestream.IsAvailable;
     public uint TerritoryId => this.clientState.TerritoryType;
+    public string CurrentMapName { get; private set; } = "未进入地图";
     public string CurrentTargetDescription => this.GetCurrentTarget()?.DisplayName ?? "无";
     public int CurrentSpawnPointNumber => this.spawnPoints.Count == 0 ? 0 : this.spawnPointIndex + 1;
     public int CurrentSpawnPointCount => this.spawnPoints.Count;
@@ -190,6 +233,10 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     public int CompletedTargetCount => this.TargetProgress.Count(progress => progress.IsCompleted);
     public int TotalTargetCount => this.TargetProgress.Count;
     public int CurrentTargetIndex => this.targetIndex;
+    public string SingleTargetResult => this.singleTargetResult;
+    public bool IsSingleTargetActive => this.singleTargetActive;
+    public int SingleTargetRequiredCount => this.singleTargetPreset?.Targets.FirstOrDefault()?.StopConditions
+        .FirstOrDefault(condition => condition.Kind == MobStopConditionKind.MobCount)?.MobCount ?? 0;
     public IReadOnlyList<DiagnosticEntry> Diagnostics
     {
         get
@@ -224,8 +271,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     public bool IsCurrentConfiguredTarget(MobSnapshot mob)
     {
-        return this.configuration.GetActivePresetList().Targets.Any(target =>
-            target.BNpcNameId == mob.BNpcNameId
+        return this.GetActivePlan().Targets.Any(target =>
+            this.MatchesTarget(target, mob.BNpcNameId)
             && target.TerritoryTypeId == this.TerritoryId);
     }
 
@@ -238,22 +285,126 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             this.diagnostics.Clear();
     }
 
-    public void Start() => this.QueueFrameworkAction(this.StartOnFrameworkThread, "启动");
+    public void Start() => this.QueueFrameworkAction(() =>
+    {
+        if (this.CanStart)
+            this.StartOnFrameworkThread();
+    }, "开始刷怪");
+
+    public void StartCurrentRun() => this.QueueFrameworkAction(this.StartOnFrameworkThread, "开始或继续当前流程");
+
+    public void StartBeastmaster(bool testMode = false) => this.QueueFrameworkAction(
+        () => this.StartBeastmasterOnFrameworkThread(testMode), testMode ? "测试抓捕" : "开始抓捕");
+
+    private void StartBeastmasterOnFrameworkThread(bool testMode)
+    {
+        if (!this.CanStartBeastmaster(testMode))
+            return;
+        if (this.State == AutomationState.Paused)
+        {
+            this.StartOnFrameworkThread();
+            return;
+        }
+        if (this.objectTable.LocalPlayer?.ClassJob.RowId != BeastmasterCatalog.JobId)
+        {
+            this.FailAutomation("请先切换为驯兽师，再开始抓捕");
+            return;
+        }
+        var entries = BeastmasterCatalog.Entries
+            .Where(entry => this.configuration.BeastmasterSelectedPets.Contains(entry.Number)).ToArray();
+        if (entries.Length == 0)
+        {
+            this.FailAutomation("请先在驯兽师页勾选要抓捕的魔兽");
+            return;
+        }
+        this.beastmasterTestMode = testMode;
+        this.beastmasterContentId = this.playerState.ContentId;
+        this.beastmasterPlan = new MobGrinderPreset
+        {
+            Name = testMode ? "驯兽师测试抓捕" : "驯兽师图鉴",
+            Targets = entries.Select(entry => new MobTargetPreset
+            {
+                BNpcNameId = entry.NameIds[0], TerritoryTypeId = entry.TerritoryId,
+                BeastmasterPetId = entry.Number,
+            }).ToList(),
+        };
+        this.beastmasterDataWaitStartedAt = DateTime.UtcNow;
+        this.nextBeastmasterSyncAt = DateTime.MinValue;
+        if (testMode)
+        {
+            this.BeastmasterDataReady = false;
+            this.beastmasterUnlocks = new HashSet<uint>();
+            this.BeastmasterDataStatus = "测试抓捕：每种魔兽先击败一只，再检查图鉴";
+        }
+        this.StartOnFrameworkThread();
+    }
+
+    /// <summary>Starts an in-memory one-target run for an external automation plugin.</summary>
+    public bool StartSingleTarget(uint bnpcNameId, uint territoryTypeId, int requiredCount)
+    {
+        if (bnpcNameId == 0 || territoryTypeId == 0 || requiredCount <= 0
+            || this.State != AutomationState.Stopped || this.singleTargetActive || this.IsBeastmasterActive)
+            return false;
+
+        this.QueueFrameworkAction(
+            () => this.StartSingleTargetOnFrameworkThread(bnpcNameId, territoryTypeId, requiredCount),
+            "启动 IPC 单目标");
+        return true;
+    }
+
+    private void StartSingleTargetOnFrameworkThread(uint bnpcNameId, uint territoryTypeId, int requiredCount)
+    {
+        if (this.State != AutomationState.Stopped || this.singleTargetActive || this.IsBeastmasterActive)
+            return;
+
+        this.singleTargetPreviousPresetIndex = this.configuration.ActivePresetListIndex;
+        this.singleTargetPreviousRunMode = this.configuration.RunMode;
+        this.singleTargetPreset = new MobGrinderPreset
+        {
+            Name = "IPC 单目标",
+            Targets =
+            [
+                new MobTargetPreset
+                {
+                    BNpcNameId = bnpcNameId,
+                    TerritoryTypeId = territoryTypeId,
+                    StopConditions =
+                    [new MobStopCondition { Kind = MobStopConditionKind.MobCount, MobCount = requiredCount }],
+                },
+            ],
+        };
+        this.configuration.PresetLists.Add(this.singleTargetPreset);
+        this.configuration.ActivePresetListIndex = this.configuration.PresetLists.Count - 1;
+        this.configuration.RunMode = MobRunMode.StopAfterOneCycle;
+        this.singleTargetActive = true;
+        this.singleTargetResult = "Running";
+        this.StartOnFrameworkThread();
+        this.AddDiagnostic(
+            DiagnosticSeverity.Information,
+            $"IPC 已启动单目标：BNpcNameId={bnpcNameId}，地图={territoryTypeId}，数量={requiredCount}");
+    }
 
     private void StartOnFrameworkThread()
     {
-        if (!this.CanStart)
+        if (!this.CanStartCurrent)
             return;
+        if (this.IsBeastmasterActive && this.objectTable.LocalPlayer?.ClassJob.RowId != BeastmasterCatalog.JobId)
+        {
+            this.FailAutomation("当前职业不是驯兽师，已停止抓捕");
+            return;
+        }
         this.configuration.Enabled = true;
         if (this.State == AutomationState.Stopped)
         {
             this.ResetRuntime(resetTargetProgress: true);
-            this.SetState(AutomationState.ValidatingPlan, "正在验证当前预设");
+            this.SetState(AutomationState.ValidatingPlan, this.IsBeastmasterTestActive
+                ? "测试抓捕已启动，先击败目标再检查图鉴"
+                : this.IsBeastmasterActive ? "抓捕已启动，正在核对图鉴" : "正在检查当前预设");
             this.log.Information("MobGrinder 自动刷怪已启动");
         }
         else
         {
-            this.SetState(this.pausedFromState, "已继续自动流程");
+            this.SetState(this.pausedFromState, "已继续运行");
             this.log.Information("MobGrinder 自动刷怪已继续");
         }
     }
@@ -267,7 +418,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.pausedFromState = this.State;
         this.configuration.Enabled = false;
         this.StopMovement();
-        this.SetState(AutomationState.Paused, "已暂停；导航已停止，未释放技能");
+        this.SetState(AutomationState.Paused, "已暂停，插件已停止移动和释放技能");
         this.log.Information("MobGrinder 已暂停");
     }
 
@@ -278,9 +429,16 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         if (!this.CanStop)
             return;
 
+        bool hadSingleTarget = this.singleTargetActive;
         this.configuration.Enabled = false;
         this.StopMovement();
         this.ResetRuntime();
+        this.beastmasterPlan = null;
+        if (hadSingleTarget)
+        {
+            this.singleTargetResult = "Stopped";
+            this.RestoreSingleTargetPlan();
+        }
         this.pausedFromState = AutomationState.ValidatingPlan;
         this.SetState(AutomationState.Stopped, "已停止");
         this.mobs = [];
@@ -296,8 +454,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.Scan(DateTime.UtcNow);
         if (previousState is AutomationState.Stopped or AutomationState.Paused)
             this.StatusReason = previousState == AutomationState.Stopped
-                ? "已执行一次手动扫描；自动流程仍未启动"
-                : "已执行一次手动扫描；仍处于暂停状态";
+                ? "周边野怪列表已刷新，尚未启动"
+                : "周边野怪列表已刷新，当前仍为暂停状态";
     }
 
     public void CaptureSupplementData() => this.QueueFrameworkAction(this.CaptureSupplementDataOnFrameworkThread, "采集补充数据");
@@ -314,7 +472,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         }
 
         IBattleNpc? target = this.targetManager.Target as IBattleNpc;
-        MobTargetPreset? configuredTarget = this.configuration.GetActivePresetList().Targets.ElementAtOrDefault(this.targetIndex);
+        MobTargetPreset? configuredTarget = this.GetActivePlan().Targets.ElementAtOrDefault(this.targetIndex);
         string position = string.Create(
             CultureInfo.InvariantCulture,
             $"{player.Position.X:0.######};{player.Position.Y:0.######};{player.Position.Z:0.######}");
@@ -422,14 +580,54 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     {
         this.configuration.Enabled = false;
         this.StopMovement();
+        this.RestoreSingleTargetPlan();
+        this.beastmasterPlan = null;
         this.mobs = [];
     }
 
     private void OnFrameworkUpdate(IFramework _)
     {
+        this.CurrentMapName = this.spawnData.GetTerritoryName(this.clientState.TerritoryType);
+        // Drain late SimpleMove results even after pause/stop has cancelled a landing move.
+        this.combatLanding.PumpCancellation();
+        DateTime syncNow = DateTime.UtcNow;
+        if (syncNow >= this.nextBeastmasterSyncAt)
+        {
+            this.nextBeastmasterSyncAt = syncNow.AddMilliseconds(500);
+            if (!this.ShouldCheckBeastmasterUnlocks)
+            {
+                this.BeastmasterDataStatus = "测试抓捕：先击败当前目标，再检查图鉴";
+            }
+            else if (this.clientState.IsLoggedIn && this.playerState.IsLoaded && !this.IsBetweenAreas())
+            {
+                this.BeastmasterDataReady = this.beastmasterGame.TryReadUnlocks(out var unlocks, out var reason);
+                this.beastmasterUnlocks = unlocks;
+                this.BeastmasterDataStatus = reason;
+            }
+            else
+            {
+                this.BeastmasterDataReady = false;
+                this.beastmasterUnlocks = new HashSet<uint>();
+                this.BeastmasterDataStatus = "等待角色和图鉴加载";
+            }
+        }
         if (this.State is AutomationState.Stopped or AutomationState.Paused)
             return;
         DateTime now = DateTime.UtcNow;
+        if (this.IsBeastmasterActive)
+        {
+            if (!this.clientState.IsLoggedIn || this.playerState.ContentId != this.beastmasterContentId
+                || (!this.IsBetweenAreas() && this.objectTable.LocalPlayer?.ClassJob.RowId != BeastmasterCatalog.JobId))
+            {
+                this.FailAutomation("角色或职业已变更，已停止抓捕");
+                return;
+            }
+            if (this.objectTable.LocalPlayer?.IsDead == true)
+            {
+                this.FailAutomation("角色已死亡，已停止抓捕");
+                return;
+            }
+        }
         if (now >= this.nextScanAt)
             this.Scan(now);
 
@@ -452,17 +650,26 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             return;
         }
 
-        if (this.TryInterruptCruiseForTarget(now))
-            return;
-
         try
         {
+            if (this.IsBeastmasterActive && this.ShouldCheckBeastmasterUnlocks && !this.BeastmasterDataReady)
+            {
+                this.StopMovement();
+                this.StatusReason = this.BeastmasterDataStatus;
+                if (this.beastmasterDataWaitStartedAt == DateTime.MinValue)
+                    this.beastmasterDataWaitStartedAt = now;
+                if (now - this.beastmasterDataWaitStartedAt >= TimeSpan.FromSeconds(30))
+                    this.FailAutomation(this.BeastmasterDataStatus + "；等待超过 30 秒，已停止抓捕");
+                return;
+            }
+            this.beastmasterDataWaitStartedAt = DateTime.MinValue;
+            if (this.TryInterruptCruiseForTarget(now))
+                return;
             this.ProcessState(now);
         }
         catch (Exception ex)
         {
-            this.StopMovement();
-            this.SetState(AutomationState.Stopped, $"自动流程异常，已停止：{ex.Message}");
+            this.FailAutomation($"自动流程异常，已停止：{ex.Message}");
             this.configuration.Enabled = false;
             this.AddDiagnostic(DiagnosticSeverity.Error, $"自动流程异常：{ex}");
             this.log.Error(ex, "MobGrinder 自动流程发生未处理异常");
@@ -474,7 +681,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         switch (this.State)
         {
             case AutomationState.WaitingForPlayer:
-                this.SetState(AutomationState.ValidatingPlan, "角色已就绪，正在验证当前预设");
+                this.SetState(AutomationState.ValidatingPlan, "角色已就绪，正在检查当前预设");
                 break;
             case AutomationState.ValidatingPlan:
                 this.ValidateCurrentTarget(now);
@@ -524,7 +731,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 this.spawnPointIndex = (this.spawnPointIndex + 1) % Math.Max(1, this.spawnPoints.Count);
                 this.currentHoverResolved = false;
                 this.EndTravelSession();
-                this.SetState(AutomationState.PreparingFlight, "当前目标未满足停止条件，前往下一个刷新点");
+                this.SetState(AutomationState.PreparingFlight, "当前目标尚未完成，前往下一个刷新点");
                 break;
             case AutomationState.AdvancingTarget:
                 this.AdvanceTarget(now);
@@ -534,10 +741,10 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     private void ValidateCurrentTarget(DateTime now)
     {
-        MobGrinderPreset preset = this.configuration.GetActivePresetList();
+        MobGrinderPreset preset = this.GetActivePlan();
         if (preset.Targets.Count == 0)
         {
-            this.FailAutomation("当前预设没有野怪项目");
+            this.FailAutomation("当前预设没有目标，请先在预设页添加野怪");
             return;
         }
         if (this.targetProgressPresetIndex != this.configuration.ActivePresetListIndex
@@ -549,6 +756,15 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
         this.targetIndex = Math.Clamp(this.targetIndex, 0, preset.Targets.Count - 1);
         MobTargetPreset target = preset.Targets[this.targetIndex];
+        if (target.BeastmasterPetId != 0)
+        {
+            var entry = BeastmasterCatalog.Entries.First(entry => entry.Number == target.BeastmasterPetId);
+            if (entry.MinLevel > this.playerState.EffectiveLevel)
+            {
+                this.FailAutomation($"无法捕获「{entry.Name}」：目标最低为 {entry.MinLevel} 级，高于角色当前等级");
+                return;
+            }
+        }
         if (target.BNpcNameId == 0 || target.TerritoryTypeId == 0)
         {
             this.FailAutomation($"预设第 {this.targetIndex + 1} 项尚未选择有效的地图和野怪");
@@ -564,7 +780,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 ? $"MobSpawn.csv 中没有当前项目的静态刷新点记录（BNpcNameId={target.BNpcNameId}，TerritoryTypeId={target.TerritoryTypeId}）"
                 : $"当前项目读取到 {rawCount} 条静态刷新点记录，但启动时坐标反算成功 0 条（BNpcNameId={target.BNpcNameId}，TerritoryTypeId={target.TerritoryTypeId}）";
             this.AddDiagnostic(DiagnosticSeverity.Error, reason);
-            this.FailAutomation(reason);
+            this.FailAutomation("当前目标缺少可用刷新点，请更换目标或补充坐标。详情见运行日志。");
             return;
         }
         this.spawnPointIndex = Math.Clamp(this.spawnPointIndex, 0, this.spawnPoints.Count - 1);
@@ -606,7 +822,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             return;
         }
         this.teleportRequestedAt = now;
-        this.SetState(AutomationState.WaitingForTerritory, $"正在传送到目标地图（以太之光 {plan.AetheryteId}）");
+        this.SetState(AutomationState.WaitingForTerritory, $"正在传送至{this.spawnData.GetTerritoryName(plan.TerritoryId)}");
     }
 
     private void ProcessTeleporting(DateTime now)
@@ -636,20 +852,20 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     {
         if (this.condition[ConditionFlag.InCombat])
         {
-            this.SetState(AutomationState.CleaningAggro, "检测到接战，先清理仇恨");
+            this.SetState(AutomationState.CleaningAggro, "已进入战斗，优先处理接战敌人");
             return;
         }
         if (!this.spawnPointHeightsResolved && !this.TryResolveAllSpawnPointHeights())
         {
             this.StatusReason = string.IsNullOrWhiteSpace(this.lastHoverResolutionDiagnostic)
-                ? "正在预解析当前项目的全部刷新点地面高度"
-                : this.lastHoverResolutionDiagnostic;
+                ? "正在准备刷新点路线"
+                : "刷新点路线准备失败，正在重试。详情见运行日志。";
             return;
         }
         if (this.spawnPointHoverDestinations.Count != this.spawnPoints.Count)
         {
             this.spawnPointHeightsResolved = false;
-            this.StatusReason = "刷新点预解析结果数量不一致，准备重新解析";
+            this.StatusReason = "刷新点路线尚未就绪，正在重新准备";
             return;
         }
         this.currentHoverDestination = this.spawnPointHoverDestinations[this.spawnPointIndex];
@@ -680,7 +896,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             && !this.mount.IsMountTransition)
         {
             this.EndTravelSession();
-            this.SetState(AutomationState.PreparingFlight, "飞行坐骑状态已消失，重新准备巡回");
+            this.SetState(AutomationState.PreparingFlight, "飞行已中断，正在重新准备出发");
             return;
         }
         FieldNavigation.NavigationTravelUpdate update = this.TickTravelSession(
@@ -706,7 +922,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private void WaitAtSpawnPoint(DateTime now)
     {
         if (now >= this.spawnWaitUntil)
-            this.SetState(AutomationState.AdvancingSpawnPoint, "刷新点等待结束，继续下一个刷新点");
+            this.SetState(AutomationState.AdvancingSpawnPoint, "等待结束，前往下一个刷新点");
     }
 
     private void BeginTarget(IBattleNpc target, int configuredTargetIndex, DateTime now)
@@ -732,8 +948,13 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.EndTravelSession();
         this.StopMovement();
         this.selectedTargetId = target.GameObjectId;
+        this.beastmasterCombat.Reset();
+        this.beastmasterCombo.Reset();
+        this.nextBeastmasterActionAt = DateTime.MinValue;
         this.selectedTargetIndex = configuredTargetIndex;
         this.selectedTargetWasEngaged = false;
+        this.selectedTargetDefeated = false;
+        this.selectedTargetDefeatRecorded = false;
         this.combatWaitDeadline = DateTime.MinValue;
         this.forceCombatReposition = false;
         this.combatRepositionAttempted = false;
@@ -742,11 +963,14 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.targetManager.Target = target;
         this.walkSprintAttempted = false;
         this.SetState(AutomationState.PreparingTargetApproach,
-            $"发现目标「{target.Name.TextValue}」，距离 {HorizontalDistance(player.Position, target.Position):0.0}，采用{TargetApproachLabel(this.targetApproachMode)}");
+            $"发现目标「{target.Name.TextValue}」，距离 {HorizontalDistance(player.Position, target.Position):0.0} 码，准备{TargetApproachLabel(this.targetApproachMode)}");
     }
 
     private void PrepareTargetApproach(DateTime now)
     {
+        if (this.combatLanding.State != CombatLandingState.Idle
+            && !this.TryCompleteCombatLanding(now, this.targetApproach.Destination, "接近前落地"))
+            return;
         // Re-evaluate at the moment we are about to issue movement.  A target can
         // be detected while the player is still descending or while the previous
         // navigation is settling; using only the distance from BeginTarget can
@@ -781,7 +1005,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         if (approachTarget is null)
         {
             this.EndTravelSession();
-            this.SetState(AutomationState.CleaningAggro, "目标已消失，开始清理剩余仇恨");
+            this.SetState(AutomationState.CleaningAggro, "目标已消失，正在处理其他接战敌人");
             return;
         }
 
@@ -789,8 +1013,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         {
             if (this.mount.IsInFlight)
             {
-                this.landing.BeginDescending();
-                this.StatusReason = "目标在 20 yalms 内，先落地步行接近";
+                this.TryCompleteCombatLanding(now, approachTarget.Position, "步行接近前落地");
                 return;
             }
             if (!this.TryEnsureDismounted(now, "步行接近目标"))
@@ -800,8 +1023,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         {
             if (this.mount.IsInFlight)
             {
-                this.landing.BeginDescending();
-                this.StatusReason = "目标在 20–25 yalms 内，正在落地改用地面坐骑";
+                this.TryCompleteCombatLanding(now, approachTarget.Position, "地面坐骑接近前落地");
                 return;
             }
             if (!this.TryEnsureMounted(now, "地面坐骑接近目标"))
@@ -815,9 +1037,12 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.landing.StopDescending();
         if (this.targetApproachMode == TargetApproachMode.Walk)
             this.TryReleaseWalkSprintOnce();
+        // Keep navigation, arrival and diagnostics on the same position snapshot.
+        // A mob's short patrol must not turn a completed path into a navigation stall.
+        this.targetApproach = new MobTargetApproach(approachTarget.Position);
         this.StartTravelSession(
             now,
-            approachTarget.Position,
+            this.targetApproach.Destination,
             this.targetApproachMode == TargetApproachMode.Fly
                 ? FieldNavigation.NavigationTravelIntent.Fly
                 : FieldNavigation.NavigationTravelIntent.Ground,
@@ -828,7 +1053,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             : this.targetApproachMode == TargetApproachMode.Fly
                 ? "地面导航"
                 : TargetApproachLabel(this.targetApproachMode);
-        this.SetState(AutomationState.FlyingToTarget, $"使用{activeTravelLabel}前往目标");
+        this.SetState(AutomationState.FlyingToTarget, $"正在{activeTravelLabel}接近目标");
     }
 
     private void FlyToTarget(DateTime now)
@@ -836,8 +1061,9 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         IBattleNpc? target = this.FindBattleNpc(this.selectedTargetId);
         if (target is null || target.IsDead || target.CurrentHp == 0)
         {
+            this.selectedTargetDefeated |= target is not null && (target.IsDead || target.CurrentHp == 0);
             this.EndTravelSession();
-            this.SetState(AutomationState.CleaningAggro, "目标已消失或死亡，开始清理剩余仇恨");
+            this.SetState(AutomationState.CleaningAggro, "目标已消失或死亡，正在处理其他接战敌人");
             return;
         }
         this.targetManager.Target = target;
@@ -859,7 +1085,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             && (!this.mount.IsMounted || this.mount.IsMountTransition || this.mount.IsInFlight))
         {
             this.StopMovement();
-            this.SetState(AutomationState.PreparingTargetApproach, "地面坐骑尚未稳定，暂停目标导航");
+            this.SetState(AutomationState.PreparingTargetApproach, "等待上坐骑后继续接近目标");
             return;
         }
 
@@ -867,7 +1093,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             && (this.mount.IsMounted || this.mount.IsInFlight || this.mount.IsMountTransition))
         {
             this.StopMovement();
-            this.SetState(AutomationState.PreparingTargetApproach, "步行接近要求实际已下坐骑，暂停目标导航");
+            this.SetState(AutomationState.PreparingTargetApproach, "等待下坐骑后步行接近目标");
             return;
         }
 
@@ -877,24 +1103,23 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             && !this.mount.IsMountTransition)
         {
             this.StopMovement();
-            if (HorizontalDistance(player.Position, target.Position) <= this.configuration.CombatApproachRadius)
+            if (this.targetApproach.HasArrived(player.Position, this.configuration.CombatApproachRadius))
             {
-                this.AddDiagnostic(DiagnosticSeverity.Warning, "飞行接近过程中坐骑状态已消失，但目标已在战斗接近半径内；直接等待战斗插件接管");
-                this.BeginWaitingForCombat("目标已在接近范围内且角色已下坐骑，等待战斗插件接战");
+                this.AddDiagnostic(DiagnosticSeverity.Warning, "飞行接近过程中坐骑状态已消失，但已到达目标导航起始位置的接近范围；直接等待战斗插件接管");
+                this.BeginWaitingForCombat("已接近目标并下坐骑，等待战斗插件接战");
             }
             else
             {
                 this.targetApproachMode = TargetApproachMode.Walk;
-                this.SetState(AutomationState.PreparingTargetApproach, "飞行坐骑状态已消失，改为步行接近目标");
+                this.SetState(AutomationState.PreparingTargetApproach, "飞行已中断，改为步行接近目标");
             }
             return;
         }
 
         FieldNavigation.NavigationTravelUpdate update = this.TickTravelSession(
             now,
-            target.Position,
-            () => HorizontalDistance(player.Position, target.Position)
-                <= this.configuration.CombatApproachRadius);
+            this.targetApproach.Destination,
+            () => this.targetApproach.HasArrived(player.Position, this.configuration.CombatApproachRadius));
         if (update.Outcome == FieldNavigation.NavigationTravelOutcome.Failed)
         {
             ulong skippedId = this.selectedTargetId;
@@ -908,7 +1133,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 $"目标导航失败，暂时跳过对象 ID 0x{skippedId:X}：stage={update.FailureStage}; "
                 + $"rejection={update.Rejection}; reason={update.Reason}");
             this.SetState(AutomationState.AdvancingSpawnPoint,
-                $"目标导航失败，暂时跳过对象 ID 0x{skippedId:X}");
+                "无法到达目标，已暂时跳过");
             return;
         }
         if (update.Outcome == FieldNavigation.NavigationTravelOutcome.Arrived)
@@ -916,27 +1141,23 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             this.forceCombatReposition = false;
             this.EndTravelSession();
             if (this.mount.IsMounted || this.mount.IsInFlight)
-                this.SetState(AutomationState.LandingForCombat, "已接近目标，准备落地并交给战斗插件");
+                this.SetState(AutomationState.LandingForCombat, "已接近目标，准备落地战斗");
             else
-                this.BeginWaitingForCombat("已接近目标，等待战斗插件接管");
+                this.BeginWaitingForCombat("已接近目标，等待战斗插件接战");
         }
     }
 
     private void LandForCombat(DateTime now)
     {
-        if (this.mount.IsInFlight)
-        {
-            this.landing.BeginDescending();
-            this.StatusReason = "目标附近，正在下降";
+        if (!this.TryCompleteCombatLanding(now, this.targetApproach.Destination, "战斗前落地"))
             return;
-        }
         if (this.targetApproachMode == TargetApproachMode.GroundMount && !this.mount.IsMounted)
         {
             this.AddDiagnostic(
                 DiagnosticSeverity.Warning,
                 "地面坐骑目标已到达接近距离但实际未骑乘；切换为步行接近，禁止直接进入错误的坐骑战斗等待状态");
             this.targetApproachMode = TargetApproachMode.Walk;
-            this.SetState(AutomationState.PreparingTargetApproach, "地面坐骑未成功，改为步行接近目标");
+            this.SetState(AutomationState.PreparingTargetApproach, "未能上坐骑，改为步行接近目标");
             return;
         }
         this.landing.StopDescending();
@@ -946,11 +1167,125 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             this.BeginWaitingForCombat("已落地，等待战斗插件接战");
     }
 
+    private bool TryCompleteCombatLanding(DateTime now, Vector3 center, string context)
+    {
+        IBattleNpc? target = this.FindBattleNpc(this.selectedTargetId);
+        IPlayerCharacter? player = this.objectTable.LocalPlayer;
+        if (player is null)
+            return false;
+        if (target is null || target.IsDead || target.CurrentHp == 0)
+        {
+            this.selectedTargetDefeated |= target is not null && (target.IsDead || target.CurrentHp == 0);
+            this.StopMovement();
+            this.SetState(AutomationState.CleaningAggro, "落地期间目标已消失或死亡，正在处理其他接战敌人");
+            return false;
+        }
+        MobEligibility eligibility = this.EvaluateMobEligibility(target, player.GameObjectId);
+        if (!eligibility.IsEligible)
+        {
+            this.StopMovement();
+            this.targetManager.Target = null;
+            this.selectedTargetId = 0;
+            this.SetState(AutomationState.PreparingFlight, $"落地期间目标不再符合接战条件：{eligibility.Reason}");
+            return false;
+        }
+        if (this.combatLanding.State == CombatLandingState.Idle)
+        {
+            if (!this.mount.IsInFlight)
+                return true;
+            this.EndTravelSession();
+            this.combatLanding.Start(now, player.Position, center, this.configuration.CombatApproachRadius);
+        }
+        CombatLandingState previousState = this.combatLanding.State;
+        int previousPoint = this.combatLanding.PointIndex;
+        CombatLandingUpdate update = this.combatLanding.Tick(now, player.Position, this.mount.IsInFlight,
+            this.noFlyZones.Find(this.clientState.TerritoryType, player.Position) is not null);
+        this.StatusReason = $"{context}：落点 {update.PointIndex + 1}/4，{update.Reason}";
+        if (previousState != update.State || previousPoint != update.PointIndex)
+            this.AddDiagnostic(update.State == CombatLandingState.Repositioning
+                ? DiagnosticSeverity.Warning : DiagnosticSeverity.Information,
+                $"{this.StatusReason}；position={player.Position}；destination={this.combatLanding.Destination}");
+        if (update.State == CombatLandingState.Failed)
+        {
+            ulong skippedId = this.selectedTargetId;
+            this.skippedTargetObjectIds.Add(skippedId);
+            this.selectedTargetId = 0;
+            this.forceCombatReposition = false;
+            this.targetInterruptedBeforeArrival = false;
+            this.targetManager.Target = null;
+            this.StopMovement();
+            this.AddDiagnostic(DiagnosticSeverity.Warning, $"落地恢复失败，跳过对象 ID 0x{skippedId:X}：{update.Reason}");
+            this.SetState(AutomationState.AdvancingSpawnPoint, $"落地恢复失败，跳过当前目标并继续巡回：{update.Reason}");
+            return false;
+        }
+        if (update.State != CombatLandingState.Landed)
+            return false;
+        this.combatLanding.Cancel();
+        return true;
+    }
+
     private void DismountForCombat(DateTime now)
     {
         if (!this.TryEnsureDismounted(now, "战斗接近"))
             return;
-        this.BeginWaitingForCombat("已下坐骑，等待战斗插件击杀目标");
+        this.BeginWaitingForCombat(this.IsBeastmasterActive ? "已下坐骑，准备抓捕" : "已下坐骑，等待战斗插件击杀目标");
+    }
+
+    private void ProcessBeastmasterCombat(IBattleNpc target, DateTime now, bool allowCapture)
+    {
+        IPlayerCharacter? player = this.objectTable.LocalPlayer;
+        if (player is null || player.IsDead || this.IsMounted || this.IsCasting || this.IsBetweenAreas()
+            || now < this.nextBeastmasterActionAt)
+            return;
+        if (!this.EvaluateMobEligibility(target, player.GameObjectId).IsEligible)
+            return;
+        bool capture = allowCapture && this.beastmasterCombat.ShouldCapture(
+            this.playerState.EffectiveLevel, target.Level, target.CurrentHp, target.MaxHp,
+            this.configuration.BeastmasterCaptureHpPercent);
+        if (capture)
+            this.nativeGameState.StopAutoAttack();
+        float reach = capture ? 9f : 2.5f;
+        bool InRange() => HorizontalDistance(player.Position, target.Position)
+            <= player.HitboxRadius + target.HitboxRadius + reach;
+        if (!InRange())
+        {
+            if (!this.travelSessionActive)
+                this.StartTravelSession(now, target.Position, FieldNavigation.NavigationTravelIntent.Ground,
+                    FieldNavigation.GroundDestinationKind.LiveObject, "驯兽师技能接近");
+            var update = this.TickTravelSession(now, target.Position, InRange);
+            if (update.Outcome == FieldNavigation.NavigationTravelOutcome.Failed)
+            {
+                this.FailAutomation($"驯兽师战斗接近失败：{update.Reason}");
+                return;
+            }
+            // Moving into skill range is part of engagement, not a failed pull.
+            this.combatWaitDeadline = now.AddSeconds(10);
+            return;
+        }
+        this.EndTravelSession();
+        uint action = BeastmasterCatalog.CaptureActionId;
+        if (!capture)
+        {
+            bool useCombo = !allowCapture || this.beastmasterCombat.HasThresholdCapture;
+            NativeComboState combo = this.nativeGameState.ReadComboState();
+            action = this.beastmasterCombo.NextAttack(target.GameObjectId, useCombo, combo.ActionId, combo.TimeRemaining,
+                useCombo && this.beastmasterGame.IsAttackLearned(BeastmasterComboPolicy.AxebladeBiteActionId, this.playerState.EffectiveLevel),
+                useCombo && this.beastmasterGame.IsAttackLearned(BeastmasterComboPolicy.ShieldsplitterActionId, this.playerState.EffectiveLevel));
+        }
+        this.nextBeastmasterActionAt = now.AddMilliseconds(200);
+        if (!this.nativeGameState.TryUseTargetedAction(action, player, target))
+            return;
+        if (target.GameObjectId == this.selectedTargetId)
+            this.selectedTargetWasEngaged = true;
+        if (capture)
+        {
+            this.beastmasterCombat.CaptureIssued(target.CurrentHp, target.MaxHp,
+                this.configuration.BeastmasterCaptureHpPercent);
+            this.AddDiagnostic(DiagnosticSeverity.Information,
+                $"捕获已释放：{target.Name.TextValue}，HP={target.CurrentHp * 100d / target.MaxHp:0.0}%；继续击败后核对图鉴");
+        }
+        else
+            this.beastmasterCombo.AttackIssued(action);
     }
 
     private void WaitForCombat(DateTime now)
@@ -968,8 +1303,15 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             this.targetLostAt = DateTime.MinValue;
             if (target.IsDead || target.CurrentHp == 0)
             {
-                this.SetState(AutomationState.CleaningAggro, "目标已死亡，等待所有接战目标清理完毕");
+                this.selectedTargetDefeated = true;
+                this.SetState(AutomationState.CleaningAggro, "目标已击败，正在处理其他接战敌人");
                 return;
+            }
+            if (this.IsBeastmasterActive)
+            {
+                this.ProcessBeastmasterCombat(target, now, allowCapture: true);
+                if (this.State == AutomationState.Stopped)
+                    return;
             }
         }
         else
@@ -977,7 +1319,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             if (this.targetLostAt == DateTime.MinValue)
                 this.targetLostAt = now;
             if (now - this.targetLostAt >= TimeSpan.FromSeconds(2))
-                this.SetState(AutomationState.CleaningAggro, "目标已离开对象表，确认是否已清场");
+                this.SetState(AutomationState.CleaningAggro, "目标已消失，正在确认战斗是否结束");
         }
 
         if (!this.selectedTargetWasEngaged
@@ -986,7 +1328,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         {
             if (target is null || target.IsDead || target.CurrentHp == 0)
             {
-                this.SetState(AutomationState.CleaningAggro, "战斗未开始且目标已消失，确认是否已清场");
+                this.SetState(AutomationState.CleaningAggro, "目标在接战前消失，正在确认战斗状态");
                 return;
             }
 
@@ -1000,18 +1342,20 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 this.combatWaitDeadline = DateTime.MinValue;
                 this.StopMovement();
                 this.SetState(AutomationState.AdvancingSpawnPoint,
-                    $"重新飞行后仍未开始战斗，暂时跳过目标（对象 ID 0x{skippedId:X}）");
+                    "重新接近后仍未接战，已暂时跳过目标");
                 return;
             }
 
             this.StopMovement();
             this.targetManager.Target = target;
-            this.TriggerForcedFlightReposition(now, "落地后 10 秒未开始战斗，改用飞行重新导航到目标");
+            this.TriggerForcedFlightReposition(now, "落地后 10 秒未接战，重新飞行接近目标");
         }
     }
 
     private void CleanAggro(DateTime now)
     {
+        IBattleNpc? selected = this.FindBattleNpc(this.selectedTargetId);
+        this.selectedTargetDefeated |= selected is not null && (selected.IsDead || selected.CurrentHp == 0);
         IBattleNpc? aggro = this.FindAggroTarget();
         if (aggro is not null)
         {
@@ -1040,13 +1384,19 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                     this.EndTravelSession();
                 }
             }
-            this.StatusReason = $"清理接战目标：{aggro.Name.TextValue}";
+            if (this.IsBeastmasterActive)
+            {
+                this.ProcessBeastmasterCombat(aggro, now, allowCapture: aggro.GameObjectId == this.selectedTargetId);
+                if (this.State == AutomationState.Stopped)
+                    return;
+            }
+            this.StatusReason = $"正在攻击其他敌人：{aggro.Name.TextValue}";
             return;
         }
         if (this.condition[ConditionFlag.InCombat])
         {
             this.combatBecameIdleAt = DateTime.MinValue;
-            this.StatusReason = "等待战斗插件清理最后的接战目标";
+            this.StatusReason = this.IsBeastmasterActive ? "正在寻找剩余敌人，等待脱离战斗" : "等待战斗插件击败剩余敌人";
             return;
         }
         if (this.combatBecameIdleAt == DateTime.MinValue)
@@ -1060,38 +1410,63 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         if (completedTargetIndex >= 0 && completedTargetIndex < this.targetProgress.Count)
         {
             RuntimeTargetProgress progress = this.targetProgress[completedTargetIndex];
-            progress.KillCount++;
+            if (!this.selectedTargetDefeatRecorded)
+            {
+                bool confirmedDefeat = BeastmasterProgressPolicy.ShouldRecordDefeat(
+                    this.selectedTargetWasEngaged, this.selectedTargetDefeated);
+                if (!this.IsBeastmasterActive || confirmedDefeat)
+                    progress.KillCount++;
+                this.selectedTargetDefeatRecorded = true;
+                if (this.IsBeastmasterActive && confirmedDefeat)
+                {
+                    // Require a fresh post-defeat snapshot, including for already-unlocked test targets.
+                    this.BeastmasterDataReady = false;
+                    this.beastmasterUnlocks = new HashSet<uint>();
+                    this.BeastmasterDataStatus = "目标已击败，正在检查图鉴解锁状态";
+                    this.nextBeastmasterSyncAt = DateTime.MinValue;
+                    this.beastmasterDataWaitStartedAt = now;
+                    this.StatusReason = this.BeastmasterDataStatus;
+                    return;
+                }
+            }
             progress.IsCompleted = this.AreStopConditionsMet(progress.Target, progress.KillCount);
+            if (this.IsBeastmasterActive && BeastmasterProgressPolicy.ShouldRecordDefeat(
+                    this.selectedTargetWasEngaged, this.selectedTargetDefeated))
+                this.AddDiagnostic(DiagnosticSeverity.Information,
+                    $"战后图鉴确认 No.{progress.Target.BeastmasterPetId:00}："
+                    + (progress.IsCompleted ? "已解锁，进入下一项" : "未解锁，继续抓捕此魔兽"));
         }
         this.currentTargetKillCount = this.GetCurrentTargetKillCount();
         this.EndTravelSession();
         this.selectedTargetId = 0;
         this.selectedTargetIndex = -1;
         this.selectedTargetWasEngaged = false;
+        this.selectedTargetDefeated = false;
+        this.selectedTargetDefeatRecorded = false;
         this.combatWaitDeadline = DateTime.MinValue;
         this.forceCombatReposition = false;
         this.landing.StopDescending();
         this.RefreshTargetProgress();
         if (this.IsCurrentTargetComplete())
-            this.SetState(AutomationState.AdvancingTarget, "当前野怪项目停止条件已满足，进入预设下一个项目");
+            this.SetState(AutomationState.AdvancingTarget, "当前目标已完成，继续下一个目标");
         else if (this.targetInterruptedBeforeArrival)
         {
             this.targetInterruptedBeforeArrival = false;
             this.currentHoverResolved = false;
-            this.SetState(AutomationState.PreparingFlight, "已脱战，返回被抢占的原刷新点上空");
+            this.SetState(AutomationState.PreparingFlight, "已脱离战斗，返回先前的刷新点");
         }
         else
-            this.SetState(AutomationState.AdvancingSpawnPoint, "已脱离战斗，当前项目未完成，继续下一个刷新点");
+            this.SetState(AutomationState.AdvancingSpawnPoint, "已脱离战斗，前往下一个刷新点继续寻找目标");
     }
 
     private void AdvanceTarget(DateTime now)
     {
-        MobGrinderPreset preset = this.configuration.GetActivePresetList();
+        MobGrinderPreset preset = this.GetActivePlan();
         if (this.nextCycleStartAt != DateTime.MinValue)
         {
             if (now < this.nextCycleStartAt)
             {
-                this.StatusReason = "本轮预设已完成，准备开始下一轮";
+                this.StatusReason = "本轮已完成，准备开始下一轮";
                 return;
             }
 
@@ -1105,7 +1480,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             if (this.targetProgress.All(progress => progress.IsCompleted))
             {
                 this.PlayCycleCompletedSound();
-                if (this.configuration.RunMode == MobRunMode.StopAfterOneCycle)
+                if (this.ActiveRunMode == MobRunMode.StopAfterOneCycle)
                 {
                     this.FinishCycle();
                     return;
@@ -1115,7 +1490,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 // progress for the next loop. Without this pause a one-target loop appears
                 // to remain at 0 forever because reset and redraw happen in the same tick.
                 this.nextCycleStartAt = now.AddSeconds(1);
-                this.StatusReason = "本轮预设已完成，准备开始下一轮";
+                this.StatusReason = "本轮已完成，准备开始下一轮";
                 return;
             }
 
@@ -1141,7 +1516,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.teleportPlan = null;
         this.teleportRequestedAt = DateTime.MinValue;
         this.teleportCompletedAt = DateTime.MinValue;
-        this.SetState(AutomationState.ValidatingPlan, $"切换到预设项目 {this.targetIndex + 1}/{preset.Targets.Count}");
+        this.SetState(AutomationState.ValidatingPlan, $"切换目标 {this.targetIndex + 1}/{preset.Targets.Count}");
     }
 
     private void PlayCycleCompletedSound()
@@ -1166,11 +1541,18 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.StopMovement();
         this.configuration.Enabled = false;
         this.targetIndex = 0;
+        bool wasBeastmaster = this.IsBeastmasterActive;
         this.ResetRuntime();
+        this.beastmasterPlan = null;
         this.mobs = [];
+        if (this.singleTargetActive)
+        {
+            this.singleTargetResult = "Completed";
+            this.RestoreSingleTargetPlan();
+        }
         this.pausedFromState = AutomationState.ValidatingPlan;
-        this.SetState(AutomationState.Stopped, "一轮预设已完成，自动流程已停止");
-        this.log.Information("MobGrinder 一轮预设已完成，自动流程已停止");
+        this.SetState(AutomationState.Stopped, wasBeastmaster ? "所选魔兽均已解锁，抓捕已完成" : "本轮已完成，已停止刷怪");
+        this.log.Information("MobGrinder 本轮已完成，已停止刷怪");
     }
 
     private bool TryEnsureMounted(DateTime now, string context)
@@ -1187,7 +1569,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         }
         if (this.mount.HasMountedStateMismatch)
         {
-            this.StatusReason = $"{context}：原生坐骑标志与游戏条件不同步，暂停导航";
+            this.StatusReason = $"{context}：坐骑状态尚未就绪，等待后继续";
             this.AddDiagnostic(
                 DiagnosticSeverity.Debug,
                 $"{context}：暂停重复上坐骑请求；conditionMounted={this.mount.IsConditionMounted}，nativeMounted={this.mount.IsNativeMounted}");
@@ -1195,7 +1577,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         }
         if (now < this.nextMountAttemptAt)
         {
-            this.StatusReason = $"{context}：等待上坐骑请求结果";
+            this.StatusReason = $"{context}：等待上坐骑";
             return false;
         }
         if (!this.mount.CanAttemptMount)
@@ -1207,8 +1589,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         bool accepted = this.mount.TryMount();
         this.nextMountAttemptAt = now + MountRetryDelay;
         this.StatusReason = accepted
-            ? $"{context}：已请求上坐骑，等待坐骑状态稳定"
-            : $"{context}：上坐骑请求被拒绝，2 秒后重试";
+            ? $"{context}：正在上坐骑"
+            : $"{context}：暂时无法上坐骑，2 秒后重试";
         this.AddDiagnostic(
             accepted ? DiagnosticSeverity.Information : DiagnosticSeverity.Warning,
             accepted
@@ -1233,15 +1615,15 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         }
         if (now < this.nextDismountAttemptAt)
         {
-            this.StatusReason = $"{context}：等待下坐骑请求结果";
+            this.StatusReason = $"{context}：等待下坐骑";
             return false;
         }
 
         bool accepted = this.mount.TryDismount();
         this.nextDismountAttemptAt = now + MountRetryDelay;
         this.StatusReason = accepted
-            ? $"{context}：已请求下坐骑，等待状态稳定"
-            : $"{context}：下坐骑请求被拒绝，2 秒后重试";
+            ? $"{context}：正在下坐骑"
+            : $"{context}：暂时无法下坐骑，2 秒后重试";
         this.AddDiagnostic(
             accepted ? DiagnosticSeverity.Information : DiagnosticSeverity.Warning,
             accepted
@@ -1353,14 +1735,14 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             return;
         this.lastHoverResolutionDiagnostic = reason;
         this.lastHoverResolutionDiagnosticAt = now;
-        this.StatusReason = reason;
+        this.StatusReason = "刷新点路线准备失败，正在重试。详情见运行日志。";
         this.AddDiagnostic(DiagnosticSeverity.Warning, reason);
         this.log.Warning("MobGrinder 刷新点地面高度解析失败：{Reason}", reason);
     }
 
     private void InitializeTargetProgress()
     {
-        MobGrinderPreset preset = this.configuration.GetActivePresetList();
+        MobGrinderPreset preset = this.GetActivePlan();
         this.targetProgressPresetIndex = this.configuration.ActivePresetListIndex;
         this.targetProgress = preset.Targets
             .Select((target, index) => new RuntimeTargetProgress(index, target))
@@ -1379,14 +1761,14 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.RefreshTargetProgress();
         if (this.targetProgress.Count == 0)
         {
-            this.FailAutomation("当前预设没有野怪项目");
+            this.FailAutomation("当前预设没有目标，请先在预设页添加野怪");
             return false;
         }
 
         if (this.targetProgress.All(progress => progress.IsCompleted))
         {
             this.PlayCycleCompletedSound();
-            if (this.configuration.RunMode == MobRunMode.StopAfterOneCycle)
+            if (this.ActiveRunMode == MobRunMode.StopAfterOneCycle)
             {
                 this.FinishCycle();
                 return false;
@@ -1419,6 +1801,9 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     private bool AreStopConditionsMet(MobTargetPreset target, int killCount)
     {
+        if (target.BeastmasterPetId != 0)
+            return BeastmasterProgressPolicy.IsComplete(this.beastmasterTestMode, killCount,
+                this.BeastmasterDataReady, this.beastmasterUnlocks.Contains(target.BeastmasterPetId));
         return MobTargetProgressPolicy.AreStopConditionsMet(
             target,
             killCount,
@@ -1442,7 +1827,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.LogTargetDetectionSnapshot(target, nearby, player.Position, player.GameObjectId);
 
         return nearby
-            .Where(mob => mob.NameId == target.BNpcNameId
+            .Where(mob => this.MatchesTarget(target, mob.NameId)
                           && !this.skippedTargetObjectIds.Contains(mob.GameObjectId)
                           && this.EvaluateMobEligibility(mob, player.GameObjectId).IsEligible)
             .OrderBy(mob => Vector3.DistanceSquared(player.Position, mob.Position))
@@ -1470,7 +1855,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                     && mob.IsTargetable
                     && valid
                     && !friendly;
-                bool matchingName = mob.NameId == target.BNpcNameId;
+                bool matchingName = this.MatchesTarget(target, mob.NameId);
                 bool skipped = this.skippedTargetObjectIds.Contains(mob.GameObjectId);
                 MobEligibility eligibility = this.EvaluateMobEligibility(mob, playerObjectId);
                 bool candidate = attackable && matchingName && !skipped && eligibility.IsEligible;
@@ -1517,7 +1902,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             DiagnosticSeverity.Debug,
             $"目标探测快照：目标 NameId={target.BNpcNameId}，目标 TerritoryTypeId={target.TerritoryTypeId}，"
             + $"对象表 IBattleNpc={nearby.Count}（无距离裁剪），"
-            + $"UI名称过滤=\"{this.configuration.NameFilter}\"，UI最大显示数={this.configuration.MaxTrackedMobs}：{nearbyText}");
+            + $"周边野怪显示全部符合条件的目标：{nearbyText}");
 
         string candidateText = observations.Any(observation => observation.Candidate)
             ? string.Join(" | ", observations.Where(observation => observation.Candidate).Select(observation =>
@@ -1542,7 +1927,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     private bool TryInterruptCruiseForTarget(DateTime now)
     {
-        if (this.configuration.GetActivePresetList().Targets.Count == 0)
+        if (this.GetActivePlan().Targets.Count == 0)
             return false;
         if (this.State is not (
                 AutomationState.PreparingFlight
@@ -1558,7 +1943,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             if (this.IsCurrentTargetComplete())
             {
                 this.StopMovement();
-                this.SetState(AutomationState.AdvancingTarget, "当前野怪项目停止条件已满足，跳过剩余刷新点");
+                this.SetState(AutomationState.AdvancingTarget, "当前目标已完成，跳过剩余刷新点");
                 return true;
             }
             return false;
@@ -1573,7 +1958,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         mob = null;
         configuredTargetIndex = -1;
         this.RefreshTargetProgress();
-        foreach (RuntimeTargetProgress progress in this.targetProgress.Where(progress => !progress.IsCompleted))
+        foreach (RuntimeTargetProgress progress in this.targetProgress.Where(progress => !progress.IsCompleted
+            && (!this.IsBeastmasterActive || progress.Index == this.targetIndex)))
         {
             IBattleNpc? candidate = this.TryFindTargetMob(progress.Target);
             if (candidate is null)
@@ -1628,7 +2014,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         if (player is null)
             return null;
         return this.objectTable.OfType<IBattleNpc>()
-            .Where(IsAttackableMob)
+            .Where(mob => this.EvaluateMobEligibility(mob, player.GameObjectId).IsEligible)
             .Where(mob => Vector3.Distance(player.Position, mob.Position) <= AggroSearchRadius)
             .Where(mob => mob.TargetObjectId == player.GameObjectId
                           || (this.condition[ConditionFlag.InCombat] && this.nativeGameState.IsInCombat(mob)))
@@ -1642,7 +2028,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     private IReadOnlyList<Vector3> GetCurrentSpawnPoints()
     {
-        MobTargetPreset? target = this.configuration.GetActivePresetList().Targets.ElementAtOrDefault(this.targetIndex);
+        MobTargetPreset? target = this.GetActivePlan().Targets.ElementAtOrDefault(this.targetIndex);
         return target is null
             ? Array.Empty<Vector3>()
             : this.spawnData.GetWorldPointsByNameAndTerritory(target.BNpcNameId, target.TerritoryTypeId);
@@ -1650,7 +2036,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     private MobSelectionEntry? GetCurrentTarget()
     {
-        MobTargetPreset? target = this.configuration.GetActivePresetList().Targets.ElementAtOrDefault(this.targetIndex);
+        MobTargetPreset? target = this.GetActivePlan().Targets.ElementAtOrDefault(this.targetIndex);
         return target is null
             ? null
             : this.spawnData.MobTargets.FirstOrDefault(entry => entry.BNpcNameId == target.BNpcNameId && entry.TerritoryTypeId == target.TerritoryTypeId);
@@ -1658,9 +2044,10 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
 
     private IReadOnlyList<MobTargetProgress> GetTargetProgressSnapshot()
     {
-        MobGrinderPreset preset = this.configuration.GetActivePresetList();
+        MobGrinderPreset preset = this.GetActivePlan();
         IReadOnlyList<RuntimeTargetProgress> source = this.targetProgressPresetIndex == this.configuration.ActivePresetListIndex
             && this.targetProgress.Count == preset.Targets.Count
+            && this.targetProgress.Select(progress => progress.Target).SequenceEqual(preset.Targets)
             ? this.targetProgress
             : preset.Targets.Select((target, index) => new RuntimeTargetProgress(index, target)).ToArray();
         if (source.Any(progress => progress.Target.StopConditions.Count > 0 && !progress.IsCompleted))
@@ -1684,13 +2071,23 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     {
         MobSelectionEntry? entry = this.spawnData.MobTargets.FirstOrDefault(item =>
             item.BNpcNameId == target.BNpcNameId && item.TerritoryTypeId == target.TerritoryTypeId);
+        if (target.BeastmasterPetId != 0)
+        {
+            var beast = BeastmasterCatalog.Entries.First(beast => beast.Number == target.BeastmasterPetId);
+            return $"No.{beast.Number:00} {beast.Name} | {beast.MapName} | {beast.MobNames}";
+        }
         return entry?.DisplayName ?? $"未知目标（{target.TerritoryTypeId}/{target.BNpcNameId}）";
     }
 
     private string GetStopConditionProgress(MobTargetPreset target, int killCount)
     {
+        if (target.BeastmasterPetId != 0)
+            return this.IsBeastmasterTestActive && killCount == 0 ? "测试抓捕：先击败一只，再检查图鉴"
+                : !this.BeastmasterDataReady ? "等待图鉴加载"
+                : this.AreStopConditionsMet(target, killCount) ? "图鉴已解锁"
+                : $"图鉴未解锁 · 已击败 {killCount} 只";
         if (target.StopConditions.Count == 0)
-            return "无停止条件";
+            return "持续刷怪，直到手动停止";
 
         return string.Join("；", target.StopConditions.Select(condition => condition.Kind switch
         {
@@ -1698,8 +2095,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
             MobStopConditionKind.ItemCount when condition.ItemId != 0 =>
                 $"{this.spawnData.GetItemName(condition.ItemId)} "
                 + $"{this.inventoryCounter.Count(condition.ItemId)}/{Math.Max(1, condition.ItemCount)}",
-            MobStopConditionKind.ItemCount => "物品未选择",
-            _ => "未知停止条件",
+            MobStopConditionKind.ItemCount => "未选择物品",
+            _ => "无法识别的完成条件",
         }));
     }
 
@@ -1714,8 +2111,6 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.LastScanAt = now;
         this.mobs = this.objectTable.OfType<IBattleNpc>()
             .Where(mob => this.EvaluateMobEligibility(mob, player.GameObjectId).IsEligible)
-            .Where(mob => string.IsNullOrWhiteSpace(this.configuration.NameFilter)
-                          || mob.Name.TextValue.Contains(this.configuration.NameFilter, StringComparison.CurrentCultureIgnoreCase))
             .Select(mob => new MobSnapshot(
                 mob.GameObjectId,
                 mob.NameId,
@@ -1726,7 +2121,6 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 mob.MaxHp,
                 this.nativeGameState.IsInCombat(mob)))
             .OrderBy(mob => mob.Distance)
-            .Take(this.configuration.MaxTrackedMobs)
             .ToArray();
     }
 
@@ -1740,12 +2134,18 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.selectedTargetId = 0;
         this.selectedTargetIndex = -1;
         this.selectedTargetWasEngaged = false;
+        this.selectedTargetDefeated = false;
+        this.selectedTargetDefeatRecorded = false;
         this.targetInterruptedBeforeArrival = false;
         this.combatWaitDeadline = DateTime.MinValue;
         this.forceCombatReposition = false;
         this.combatRepositionAttempted = false;
         this.targetApproachMode = TargetApproachMode.Walk;
+        this.targetApproach = default;
         this.walkSprintAttempted = false;
+        this.beastmasterCombat.Reset();
+        this.beastmasterCombo.Reset();
+        this.nextBeastmasterActionAt = DateTime.MinValue;
         this.skippedTargetObjectIds.Clear();
         this.nextMountAttemptAt = DateTime.MinValue;
         this.nextDismountAttemptAt = DateTime.MinValue;
@@ -1758,12 +2158,16 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         this.teleportCompletedAt = DateTime.MinValue;
         this.nextCycleStartAt = DateTime.MinValue;
         this.EndTravelSession();
+        this.combatLanding.Cancel();
         this.landing.StopDescending();
     }
 
     private void StopMovement()
     {
+        if (this.IsBeastmasterActive)
+            this.nativeGameState.StopAutoAttack();
         this.EndTravelSession();
+        this.combatLanding.Cancel();
         this.vnavmesh.Stop();
         this.landing.StopDescending();
     }
@@ -1795,6 +2199,7 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 GroundKind = groundKind,
                 HorizontalProgress = intent == FieldNavigation.NavigationTravelIntent.Ground,
                 StallTimeout = TimeSpan.FromSeconds(GroundNavigationStallSeconds),
+                NoFlyLandingPoint = zone?.LandingPoint,
             });
         this.travelSessionActive = true;
         this.nextNavigationSnapshotAt = DateTime.MinValue;
@@ -1832,7 +2237,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
                 Vector3.Distance(player.Position, destination),
                 arrivedNow,
                 zone is not null,
-                flightState));
+                flightState,
+                zone?.LandingPoint));
 
         if (now >= this.nextNavigationSnapshotAt)
         {
@@ -1878,6 +2284,8 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private void BeginWaitingForCombat(string reason)
     {
         this.combatWaitDeadline = DateTime.UtcNow.AddSeconds(10);
+        if (this.IsBeastmasterActive)
+            reason = "已接近目标，开始抓捕";
         this.SetState(AutomationState.WaitingForCombat, reason);
     }
 
@@ -1925,8 +2333,30 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
     private void FailAutomation(string reason)
     {
         this.StopMovement();
+        this.beastmasterPlan = null;
         this.configuration.Enabled = false;
+        if (this.singleTargetActive)
+        {
+            this.singleTargetResult = "Failed";
+            this.RestoreSingleTargetPlan();
+        }
         this.SetState(AutomationState.Stopped, reason);
+    }
+
+    private void RestoreSingleTargetPlan()
+    {
+        if (!this.singleTargetActive)
+            return;
+
+        if (this.singleTargetPreset is not null)
+            this.configuration.PresetLists.Remove(this.singleTargetPreset);
+        this.configuration.ActivePresetListIndex = Math.Clamp(
+            this.singleTargetPreviousPresetIndex,
+            0,
+            Math.Max(0, this.configuration.PresetLists.Count - 1));
+        this.configuration.RunMode = this.singleTargetPreviousRunMode;
+        this.singleTargetPreset = null;
+        this.singleTargetActive = false;
     }
 
     private bool IsBetweenAreas() => this.condition[ConditionFlag.BetweenAreas] || this.condition[ConditionFlag.BetweenAreas51];
@@ -1943,6 +2373,9 @@ public sealed class MobGrinderController : IDisposable, IAsyncDisposable
         NativeMobState nativeState = this.nativeGameState.ReadMobState(mob);
         if (!IsAttackableMob(mob))
             return new(false, "基础条件不满足", nativeState);
+
+        if (this.IsBeastmasterActive && !BeastmasterCombatPolicy.CanCapture(this.playerState.EffectiveLevel, mob.Level))
+            return new(false, "等级高于角色，无法捕获", nativeState);
 
         if (nativeState.FateId != 0)
             return new(false, $"属于 FATE（FateId={nativeState.FateId}）", nativeState);

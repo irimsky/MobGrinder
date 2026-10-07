@@ -26,6 +26,8 @@ public sealed class MobStopCondition
 
 public sealed class MobTargetPreset
 {
+    [JsonIgnore]
+    public uint BeastmasterPetId { get; set; }
     public uint BNpcNameId { get; set; }
     public uint TerritoryTypeId { get; set; }
     public List<MobStopCondition> StopConditions { get; set; } = [];
@@ -39,7 +41,7 @@ public sealed class MobGrinderPreset
 
 public sealed class MobGrinderConfiguration : IPluginConfiguration
 {
-    public const int CurrentVersion = 5;
+    public const int CurrentVersion = 8;
 
     public int Version { get; set; } = CurrentVersion;
 
@@ -56,14 +58,8 @@ public sealed class MobGrinderConfiguration : IPluginConfiguration
     /// <summary>Behavior after every target in the active preset has completed.</summary>
     public MobRunMode RunMode { get; set; } = MobRunMode.Loop;
 
-    /// <summary>Maximum number of mob snapshots shown in the UI.</summary>
-    public int MaxTrackedMobs { get; set; } = 12;
-
-    /// <summary>Optional case-insensitive substring filter for mob names.</summary>
-    public string NameFilter { get; set; } = string.Empty;
-
     /// <summary>Desired height above the resolved ground while travelling, in yalms.</summary>
-    public float FlightHeight { get; set; } = 18f;
+    public float FlightHeight { get; set; } = 15f;
 
     /// <summary>Horizontal arrival tolerance for a spawn point, in yalms.</summary>
     public float SpawnPointArrivalRadius { get; set; } = 6f;
@@ -83,6 +79,9 @@ public sealed class MobGrinderConfiguration : IPluginConfiguration
     /// <summary>Whether the compact always-available run overlay is shown.</summary>
     public bool ShowOverlayWindow { get; set; }
 
+    public List<uint> BeastmasterSelectedPets { get; set; } = [];
+    public float BeastmasterCaptureHpPercent { get; set; } = 30f;
+
     /// <summary>
     /// Applies schema changes before value clamping. Keep this separate from Normalize so a
     /// configuration loaded from an older plugin version has an explicit migration path.
@@ -95,15 +94,12 @@ public sealed class MobGrinderConfiguration : IPluginConfiguration
         if (sourceVersion < 1)
         {
             this.RunMode = MobRunMode.Loop;
-            this.NameFilter ??= string.Empty;
         }
 
         if (sourceVersion < 2)
         {
-            if (this.MaxTrackedMobs == 0)
-                this.MaxTrackedMobs = 12;
             if (this.FlightHeight == 0)
-                this.FlightHeight = 18f;
+                this.FlightHeight = 15f;
             if (this.SpawnPointArrivalRadius == 0)
                 this.SpawnPointArrivalRadius = 6f;
             if (this.SpawnPointWaitSeconds == 0)
@@ -137,15 +133,29 @@ public sealed class MobGrinderConfiguration : IPluginConfiguration
             }
         }
 
+        if (sourceVersion < 6)
+        {
+            this.BeastmasterSelectedPets = [];
+            this.BeastmasterCaptureHpPercent = 30f;
+        }
+
+        // Version 7 removes the old BeastmasterEnabled switch. Newtonsoft ignores that
+        // obsolete JSON member; retain version 6 selections and the capture threshold.
+        // Version 8 removes MaxTrackedMobs/NameFilter and changes the old default height.
+        // Obsolete JSON members are ignored; preserve heights differing from the old default.
+        if (sourceVersion < 8 && this.FlightHeight == 18f)
+            this.FlightHeight = 15f;
         this.Version = CurrentVersion;
     }
 
     public void Normalize()
     {
-        this.MaxTrackedMobs = Math.Clamp(this.MaxTrackedMobs, 1, 50);
+        this.BeastmasterCaptureHpPercent = float.IsFinite(this.BeastmasterCaptureHpPercent)
+            ? Math.Clamp(this.BeastmasterCaptureHpPercent, 0f, 100f) : 30f;
+        this.BeastmasterSelectedPets = (this.BeastmasterSelectedPets ?? [])
+            .Where(id => BeastmasterCatalog.Entries.Any(entry => entry.Number == id)).Distinct().Order().ToList();
         if (!Enum.IsDefined(this.RunMode))
             this.RunMode = MobRunMode.Loop;
-        this.NameFilter ??= string.Empty;
         this.FlightHeight = Math.Clamp(this.FlightHeight, 8f, 40f);
         this.SpawnPointArrivalRadius = Math.Clamp(this.SpawnPointArrivalRadius, 2f, 20f);
         this.SpawnPointWaitSeconds = Math.Clamp(this.SpawnPointWaitSeconds, 1f, 30f);
