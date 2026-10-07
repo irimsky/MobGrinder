@@ -40,6 +40,14 @@ public sealed class MobGrinderOverlayWindow : Window
 
         this.TitleBarButtons.Add(new TitleBarButton
         {
+            Icon = FontAwesomeIcon.Cog,
+            IconOffset = new Vector2(1, 1),
+            Priority = -100,
+            Click = _ => this.mainWindow.OpenSettings(),
+            ShowTooltip = () => ImGui.SetTooltip("打开设置"),
+        });
+        this.TitleBarButtons.Add(new TitleBarButton
+        {
             Icon = FontAwesomeIcon.Home,
             IconOffset = new Vector2(1, 1),
             Priority = -100,
@@ -52,7 +60,7 @@ public sealed class MobGrinderOverlayWindow : Window
             IconOffset = new Vector2(1, 1),
             Priority = -100,
             Click = _ => this.mainWindow.OpenDiagnosticLog(),
-            ShowTooltip = () => ImGui.SetTooltip("打开诊断日志"),
+            ShowTooltip = () => ImGui.SetTooltip("打开运行日志"),
         });
     }
 

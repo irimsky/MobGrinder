@@ -1,8 +1,8 @@
 {
   "Author": "irimsky",
   "Name": "MobGrinder",
-  "Punchline": "自动传送、跑图并刷够指定数量的野怪",
-  "Description": "按预设传送到地图，骑鸟或飞行前往刷怪点；发现目标野怪就接战，并按击杀数或物品数量自动换下一个目标。战斗技能交给外部职业循环插件。使用 /mobgrinder 或 /mg 打开窗口。",
+  "Punchline": "按预设自动刷野怪，支持驯兽师图鉴抓捕",
+  "Description": "按预设传送至目标地图，骑乘坐骑或飞行前往刷新点，寻找并接战野怪。达到击杀数量或背包物品数量等完成条件后，继续其他目标。驯兽师可按图鉴顺序抓捕所选魔兽，确认解锁后继续下一种；普通刷怪的技能由外部战斗插件释放。使用 /mobgrinder 或 /mg 打开窗口。",
   "InternalName": "MobGrinder",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
@@ -11,5 +11,5 @@
   "CanUnloadAsync": true,
   "Tags": ["Automation", "Combat", "Mob"],
   "IconUrl": "https://raw.githubusercontent.com/irimsky/MobGrinder/main/images/icon.png",
-  "Changelog": "新增悬浮窗目标进度显示；扫描预设中的任意未完成目标并分别统计击杀数。"
+  "Changelog": "新增驯兽师图鉴抓捕与测试抓捕，支持捕获血量设置和攻击连招；补充九本黄道文书的野怪刷新点。改进目标接近、落地恢复和禁飞区导航。优化界面字号、地图名称、设置窗口与中文提示；一轮结束选项改为互斥勾选，删除预设增加二次确认。新增 IPC 单目标接口。"
 }

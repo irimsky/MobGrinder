@@ -14,6 +14,10 @@
       <HintPath>$(DalamudLibPath)/Dalamud.dll</HintPath>
       <Private>true</Private>
     </Reference>
+    <Reference Include="Lumina">
+      <HintPath>$(DalamudLibPath)/Lumina.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
   </ItemGroup>
 
   <ItemGroup>
@@ -32,6 +36,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MobGrinder\MobGrinder.csproj" />
+    <None Include="..\docs\zodiac-book-spawns.json" Link="zodiac-book-spawns.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\docs\beastmaster-sources.json" Link="beastmaster-sources.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <Target Name="CopyDalamudRuntimeForTests"

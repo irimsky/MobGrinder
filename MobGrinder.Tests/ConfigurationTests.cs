@@ -43,7 +43,6 @@ public sealed class ConfigurationTests
         MobGrinderConfiguration configuration = new()
         {
             Version = 0,
-            MaxTrackedMobs = 999,
             FlightHeight = 1,
             SpawnPointArrivalRadius = 99,
             SpawnPointWaitSeconds = 99,
@@ -54,7 +53,6 @@ public sealed class ConfigurationTests
         configuration.Migrate();
         configuration.Normalize();
 
-        Assert.Equal(50, configuration.MaxTrackedMobs);
         Assert.Equal(8f, configuration.FlightHeight);
         Assert.Equal(20f, configuration.SpawnPointArrivalRadius);
         Assert.Equal(30f, configuration.SpawnPointWaitSeconds);
@@ -72,6 +70,45 @@ public sealed class ConfigurationTests
         Assert.False(restored.Enabled);
         Assert.True(restored.ShowOverlayWindow);
         Assert.Equal(MobGrinderConfiguration.CurrentVersion, restored.Version);
+    }
+
+    [Fact]
+    public void VersionSevenDropsDisplayFiltersAndUpdatesDefaultHeightWithoutChangingRunSettings()
+    {
+        var configuration = JsonConvert.DeserializeObject<MobGrinderConfiguration>(
+            "{\"Version\":7,\"MaxTrackedMobs\":1,\"NameFilter\":\"松鼠\",\"FlightHeight\":18,\"RunMode\":0,\"ShowOverlayWindow\":true,\"BeastmasterSelectedPets\":[2],\"BeastmasterCaptureHpPercent\":25}")!;
+        configuration.Migrate();
+        configuration.Normalize();
+        Assert.Equal(MobGrinderConfiguration.CurrentVersion, configuration.Version);
+        Assert.Equal(15f, configuration.FlightHeight);
+        Assert.Equal(MobRunMode.StopAfterOneCycle, configuration.RunMode);
+        Assert.True(configuration.ShowOverlayWindow);
+        Assert.Equal(new uint[] { 2 }, configuration.BeastmasterSelectedPets);
+        Assert.Equal(25f, configuration.BeastmasterCaptureHpPercent);
+        string saved = JsonConvert.SerializeObject(configuration);
+        Assert.DoesNotContain("MaxTrackedMobs", saved);
+        Assert.DoesNotContain("NameFilter", saved);
+    }
+
+    [Theory]
+    [InlineData(7, 23f)]
+    [InlineData(8, 18f)]
+    public void MigrationPreservesCustomizedHeight(int version, float height)
+    {
+        MobGrinderConfiguration configuration = new() { Version = version, FlightHeight = height };
+        configuration.Migrate();
+        configuration.Normalize();
+        Assert.Equal(height, configuration.FlightHeight);
+    }
+
+    [Fact]
+    public void NewAndLegacyMissingHeightUseFifteenYalms()
+    {
+        Assert.Equal(15f, new MobGrinderConfiguration().FlightHeight);
+        MobGrinderConfiguration configuration = new() { Version = 1, FlightHeight = 0 };
+        configuration.Migrate();
+        configuration.Normalize();
+        Assert.Equal(15f, configuration.FlightHeight);
     }
 
     [Fact]

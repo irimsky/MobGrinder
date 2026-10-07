@@ -15,7 +15,7 @@ public sealed class MobGrinderLogWindow : Window
     private bool jumpToBottom;
 
     public MobGrinderLogWindow(MobGrinderController controller)
-        : base("MobGrinder - 运行诊断日志")
+        : base("MobGrinder - 运行日志")
     {
         this.controller = controller;
         this.Size = new Vector2(900, 620);
@@ -31,7 +31,7 @@ public sealed class MobGrinderLogWindow : Window
 
     public override void Draw()
     {
-        ImGui.TextDisabled("日志最多保留最近 500 条。滚动到其他位置后，自动滚动不会打断查看。");
+        ImGui.TextDisabled("保留最近 500 条日志。向上翻阅时暂停自动滚动。");
         if (ImGui.Button("复制全部日志"))
             ImGui.SetClipboardText(this.BuildLogText());
         ImGui.SameLine();
@@ -58,7 +58,7 @@ public sealed class MobGrinderLogWindow : Window
             IReadOnlyList<DiagnosticEntry> entries = this.controller.Diagnostics;
             if (entries.Count == 0)
             {
-                ImGui.TextDisabled("暂无诊断日志。");
+                ImGui.TextDisabled("暂无运行日志。");
             }
             else
             {

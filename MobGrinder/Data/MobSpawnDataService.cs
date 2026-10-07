@@ -19,6 +19,7 @@ public sealed class MobSpawnDataService
     private readonly Dictionary<uint, IReadOnlyList<MobSpawnPosition>> byTerritoryId;
     private readonly Dictionary<(uint TerritoryTypeId, uint BNpcNameId), IReadOnlyList<Vector3>> worldPointsByTarget;
     private readonly IReadOnlyDictionary<uint, string> itemNamesById;
+    private readonly IReadOnlyDictionary<uint, string> territoryNamesById;
 
     public MobSpawnDataService(IPluginLog log, IDataManager dataManager, MobCoordinateService coordinates)
     {
@@ -29,6 +30,7 @@ public sealed class MobSpawnDataService
             out List<Exception> exceptions);
 
         entries.AddRange(MobSpawnSupplementData.Entries);
+        entries.AddRange(BeastmasterCatalog.GetSpawnPositions());
         int unresolvedPositionCount = entries.Count(MobCoordinateService.IsUnresolvedMapPosition);
         if (unresolvedPositionCount != 0)
         {
@@ -69,6 +71,7 @@ public sealed class MobSpawnDataService
             })
             .Where(row => !string.IsNullOrWhiteSpace(row.Name))
             .ToDictionary(row => row.RowId, row => row.Name);
+        this.territoryNamesById = territoryNames;
 
         this.MobTargets = entries
             .GroupBy(entry => (entry.TerritoryTypeId, entry.BNpcNameId))
@@ -114,6 +117,9 @@ public sealed class MobSpawnDataService
     public IReadOnlyList<MobSelectionEntry> MobTargets { get; }
 
     public IReadOnlyList<NamedItem> ItemNames { get; }
+
+    public string GetTerritoryName(uint territoryId) => territoryId == 0
+        ? "未进入地图" : this.territoryNamesById.GetValueOrDefault(territoryId, "未知地图");
 
     public string GetItemName(uint itemId)
         => itemId == 0
