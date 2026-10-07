@@ -116,7 +116,7 @@ public sealed class BeastmasterTests
     [InlineData(true, false, false)]
     [InlineData(true, true, true)]
     public void DisappearanceOrUnengagedDeathDoesNotCountAsTestFight(bool engaged, bool death, bool expected) =>
-        Assert.Equal(expected, BeastmasterProgressPolicy.ShouldRecordDefeat(engaged, death));
+        Assert.Equal(expected, MobDefeatPolicy.ShouldRecordDefeat(engaged, death));
 
     [Theory]
     [InlineData(-5, 0)]

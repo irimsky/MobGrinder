@@ -11,5 +11,5 @@
   "CanUnloadAsync": true,
   "Tags": ["Automation", "Combat", "Mob"],
   "IconUrl": "https://raw.githubusercontent.com/irimsky/MobGrinder/main/images/icon.png",
-  "Changelog": "新增驯兽师图鉴抓捕与测试抓捕，支持捕获血量设置和攻击连招；补充九本黄道文书的野怪刷新点。改进目标接近、落地恢复和禁飞区导航。优化界面字号、地图名称、设置窗口与中文提示；一轮结束选项改为互斥勾选，删除预设增加二次确认。新增 IPC 单目标接口。"
+  "Changelog": "修复普通刷怪和 IPC 单目标任务的击杀误计数，避免目标在导航途中消失或尚未接战就死亡时提前完成任务。击杀数仅在目标已接战且确认死亡后增加；运行日志补充击杀确认、未计入原因及当前进度。"
 }
